@@ -63,7 +63,7 @@ All configuration is in `.env`. Key parameters:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `BANKROLL` | 1300 | Starting capital in USD |
-| `STRIKE_PRICE` | 100000 | Fallback only — overridden at runtime by the BTC spot price captured on the first Binance tick when each 5-minute window opens |
+| ~~`STRIKE_PRICE`~~ | — | Removed. Strike is captured dynamically from the first Binance tick at each window open (proxy for the Chainlink BTC/USD CEX price used for contract resolution) |
 | `ENTRY_THRESHOLD` | 0.03 | Minimum edge (3%) to enter a trade |
 | `MIN_EDGE` | 0.03 | Absolute minimum edge after cost deduction |
 | `MAX_BET_FRACTION` | 0.04 | Kelly fraction cap (4% of bankroll) |

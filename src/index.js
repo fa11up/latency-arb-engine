@@ -35,7 +35,7 @@ class ArbEngine {
       dryRun: CONFIG.execution.dryRun,
       bankroll: CONFIG.risk.bankroll,
       threshold: `${(CONFIG.strategy.entryThreshold * 100).toFixed(1)}%`,
-      strike: CONFIG.strategy.strikePrice,
+      resolution: "Chainlink BTC/USD CEX",
     });
 
     // ─── Wire feeds to strategy ─────────────────────────────────────
@@ -188,7 +188,7 @@ class ArbEngine {
 ║                                                               ║
 ║   Mode: ${CONFIG.execution.dryRun ? "DRY RUN (paper trading)       " : "⚠️  LIVE TRADING                "}             ║
 ║   Bankroll: $${CONFIG.risk.bankroll.toFixed(2).padEnd(12)}                               ║
-║   Strike: $${CONFIG.strategy.strikePrice.toLocaleString().padEnd(13)}                              ║
+║   Resolves via: Chainlink BTC/USD CEX                         ║
 ║   Threshold: ${(CONFIG.strategy.entryThreshold * 100).toFixed(1)}%                                          ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝\x1b[0m

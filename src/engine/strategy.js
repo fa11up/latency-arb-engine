@@ -222,7 +222,7 @@ export class Strategy {
         modelProb,
         contractPrice: this.contractMid,
         spotPrice: this.spotPrice,
-        strikePrice: this.marketOpenStrike || CONFIG.strategy.strikePrice,
+        strikePrice: this.marketOpenStrike,
         feedLag,
         vol,
         kelly: sizing.kelly,
@@ -264,10 +264,10 @@ export class Strategy {
   // ─── STATUS ─────────────────────────────────────────────────────────
   getStatus() {
     const { dailyVol } = CONFIG.strategy;
-    const strikePrice = this.marketOpenStrike || CONFIG.strategy.strikePrice;
+    const strikePrice = this.marketOpenStrike; // null until window opens
     const vol = this.volEma.value || dailyVol;
     const hoursToExpiry = this._estimateHoursToExpiry();
-    const modelProb = this.spotPrice
+    const modelProb = this.spotPrice && strikePrice
       ? impliedProbability(this.spotPrice, strikePrice, vol, hoursToExpiry)
       : null;
 

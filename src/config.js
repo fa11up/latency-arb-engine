@@ -45,10 +45,12 @@ export const CONFIG = Object.freeze({
   },
 
   // ─── Strategy ─────────────────────────────────────────────────────
+  // Strike price is NOT static — it is captured dynamically at each 5-minute
+  // window open from the first Binance tick (proxy for the Chainlink BTC/USD
+  // CEX aggregated price that Polymarket uses for contract resolution).
   strategy: {
-    strikePrice: envNum("STRIKE_PRICE", 100000),
-    entryThreshold: envNum("ENTRY_THRESHOLD", 0.08),
-    minEdge: envNum("MIN_EDGE", 0.05),
+    entryThreshold: envNum("ENTRY_THRESHOLD", 0.03),
+    minEdge: envNum("MIN_EDGE", 0.03),
     dailyVol: 0.015,  // 1.5% BTC daily vol assumption — tune to realized
   },
 

@@ -39,7 +39,7 @@ Key classes and their roles:
 
 ## Configuration
 
-All config is via `.env` (see `.env.example`). Loaded in `config.js` using `dotenv`. Config validation runs on startup and halts in live mode if Polymarket API keys are missing. Key parameters: `BANKROLL` (default 1300), `STRIKE_PRICE` (fallback only — overridden at runtime by dynamic strike capture), `ENTRY_THRESHOLD` (default 3%), `MIN_EDGE` (default 3%), `MAX_BET_FRACTION` (max 10%), `ORDER_TYPE` (default GTC), `DRY_RUN`.
+All config is via `.env` (see `.env.example`). Loaded in `config.js` using `dotenv`. Config validation runs on startup and halts in live mode if Polymarket API keys are missing. Key parameters: `BANKROLL` (default 1300), `ENTRY_THRESHOLD` (default 3%), `MIN_EDGE` (default 3%), `MAX_BET_FRACTION` (max 10%), `ORDER_TYPE` (default GTC), `DRY_RUN`. `STRIKE_PRICE` has been removed — the strike is captured dynamically at runtime.
 
 Contract IDs (`POLY_CONDITION_ID`, `POLY_TOKEN_ID_YES`, `POLY_TOKEN_ID_NO`) are optional — `MarketDiscovery` resolves them automatically at runtime if not set.
 
