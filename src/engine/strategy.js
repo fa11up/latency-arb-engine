@@ -48,18 +48,43 @@ export class Strategy {
     this.tokenIdNo = CONFIG.poly.tokenIdNo || null;
     this.marketEndDate = null; // ISO string, set by setMarket()
 
+    // Dynamic strike: BTC spot price at market open (captured on first tick after setMarket)
+    // For btc-updown-5m contracts the strike is the opening price, not a fixed level.
+    this.marketOpenStrike = null;
+
+    // Tracks how many market rotations have occurred.
+    // The startup window is unreliable because the engine may start mid-window,
+    // meaning the captured strike is NOT the true contract opening price.
+    // Signals are suppressed until the first rotation, when we know we're at window start.
+    this.marketSetCount = 0;
+
     // Signal listeners
     this._onSignal = null;
   }
 
   /**
    * Update the active market. Called by discovery on rotation.
+   * Resets marketOpenStrike so the next spot tick captures the new opening price.
    */
   setMarket({ tokenIdYes, tokenIdNo, endDate }) {
     this.tokenIdYes = tokenIdYes;
     this.tokenIdNo = tokenIdNo;
     this.marketEndDate = endDate;
-    log.info("Market updated", { tokenIdYes: tokenIdYes?.slice(0, 10) + "...", endDate });
+    // Window start = endDate minus 5-minute interval
+    this.marketWindowStart = endDate
+      ? new Date(endDate).getTime() - 300_000
+      : null;
+    this.marketOpenStrike = null; // captured on first spot tick after window opens
+    this.marketSetCount++;
+    const isStartup = this.marketSetCount === 1;
+    log.info("Market updated", {
+      tokenIdYes: tokenIdYes?.slice(0, 10) + "...",
+      endDate,
+      windowStart: this.marketWindowStart
+        ? new Date(this.marketWindowStart).toISOString()
+        : null,
+      ...(isStartup && { note: "startup window — signals suppressed until first rotation" }),
+    });
   }
 
   onSignal(handler) {
@@ -71,6 +96,17 @@ export class Strategy {
     this.spotPrice = data.mid;
     this.spotDelta = data.delta;
     this.lastSpotUpdate = data.timestamp;
+
+    // Capture market open strike on the first spot tick after the window opens.
+    // Don't capture during pre-window period (market accepting orders before start).
+    const windowOpen = !this.marketWindowStart || Date.now() >= this.marketWindowStart;
+    if (this.marketOpenStrike === null && this.marketEndDate !== null && windowOpen) {
+      this.marketOpenStrike = data.mid;
+      log.info("Market open strike captured", {
+        strike: `$${data.mid.toFixed(2)}`,
+        market: this.marketEndDate,
+      });
+    }
 
     // Use feed's realized vol estimate if available, else our own
     if (data.realizedVol > 0) {
@@ -104,14 +140,28 @@ export class Strategy {
   _evaluate() {
     if (!this.spotPrice || !this.contractMid) return;
 
-    const { strikePrice, entryThreshold, dailyVol } = CONFIG.strategy;
+    // Suppress signals on the startup window: the engine may have started mid-window,
+    // so the captured strike is not the true contract opening price.
+    if (this.marketSetCount <= 1) return;
+
+    // Suppress signals before the window officially opens (pre-market period).
+    // Prices during this period reflect speculation about opening levels, not real lag.
+    if (this.marketWindowStart && Date.now() < this.marketWindowStart) return;
+
+    // No strike captured yet (window just opened, waiting for first Binance tick).
+    if (!this.marketOpenStrike) return;
+
+    const { entryThreshold, dailyVol } = CONFIG.strategy;
+    const strikePrice = this.marketOpenStrike;
+
+    // Suppress signals in the last 60s: the book empties near expiry, creating
+    // artificial price dislocations that look like edge but resolve randomly.
+    const hoursToExpiry = this._estimateHoursToExpiry();
+    if (hoursToExpiry < 1 / 60) return;
 
     // Use EMA-smoothed vol or fallback to config
     const vol = this.volEma.value || dailyVol;
 
-    // Calculate model probability
-    // Estimate hours to expiry (most Polymarket BTC contracts are daily)
-    const hoursToExpiry = this._estimateHoursToExpiry();
     const modelProb = impliedProbability(this.spotPrice, strikePrice, vol, hoursToExpiry);
 
     // Calculate edge vs contract price
@@ -172,7 +222,7 @@ export class Strategy {
         modelProb,
         contractPrice: this.contractMid,
         spotPrice: this.spotPrice,
-        strikePrice,
+        strikePrice: this.marketOpenStrike || CONFIG.strategy.strikePrice,
         feedLag,
         vol,
         kelly: sizing.kelly,
@@ -213,7 +263,8 @@ export class Strategy {
 
   // ─── STATUS ─────────────────────────────────────────────────────────
   getStatus() {
-    const { strikePrice, dailyVol } = CONFIG.strategy;
+    const { dailyVol } = CONFIG.strategy;
+    const strikePrice = this.marketOpenStrike || CONFIG.strategy.strikePrice;
     const vol = this.volEma.value || dailyVol;
     const hoursToExpiry = this._estimateHoursToExpiry();
     const modelProb = this.spotPrice
@@ -226,12 +277,15 @@ export class Strategy {
 
     return {
       spotPrice: this.spotPrice,
+      strikePrice,
       contractMid: this.contractMid,
       modelProb,
       edge: edge?.absolute,
       edgeDirection: edge?.direction,
       smoothedEdge: this.edgeEma.value,
-      feedLag: Math.abs(this.lastSpotUpdate - this.lastContractUpdate),
+      feedLag: (this.lastSpotUpdate > 0 && this.lastContractUpdate > 0)
+        ? Math.abs(this.lastSpotUpdate - this.lastContractUpdate)
+        : null,
       realizedVol: vol,
       hoursToExpiry,
       signalCount: this.signalCount,

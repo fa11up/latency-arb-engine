@@ -31,12 +31,13 @@ Exploits the 3-7 second lag between Binance BTC spot price updates and Polymarke
 ## Signal Flow
 
 1. **Binance tick** (every 100ms): spot price, delta, realized vol
-2. **Strategy eval**: compute implied probability via binary option model
+2. **Strategy eval**: compute implied probability via binary option model (N(d2))
 3. **Edge detection**: compare model prob vs Polymarket contract mid
-4. **Signal generation**: edge > 3% AND contract is stale (>1s behind spot)
-5. **Risk check**: position limits, drawdown, cooldown, liquidity
-6. **Execution**: place order on Polymarket CLOB
-7. **Monitoring**: track position, exit on edge collapse / timeout / stop loss
+4. **Signal guards**: suppress startup window, pre-window, and near-expiry (last 60s) signals
+5. **Signal generation**: edge > 3% AND contract is stale (>1s behind spot)
+6. **Risk check**: position limits, drawdown, cooldown, liquidity
+7. **Execution**: place order on Polymarket CLOB
+8. **Monitoring**: track position, exit on edge collapse / timeout / stop loss
 
 ## Setup
 
@@ -62,7 +63,7 @@ All configuration is in `.env`. Key parameters:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `BANKROLL` | 1300 | Starting capital in USD |
-| `STRIKE_PRICE` | 100000 | BTC price the contract resolves against |
+| `STRIKE_PRICE` | 100000 | Fallback only — overridden at runtime by the BTC spot price captured on the first Binance tick when each 5-minute window opens |
 | `ENTRY_THRESHOLD` | 0.03 | Minimum edge (3%) to enter a trade |
 | `MIN_EDGE` | 0.03 | Absolute minimum edge after cost deduction |
 | `MAX_BET_FRACTION` | 0.04 | Kelly fraction cap (4% of bankroll) |
@@ -85,6 +86,8 @@ All configuration is in `.env`. Key parameters:
 ## Contract Discovery
 
 The engine uses `MarketDiscovery` to automatically find and rotate BTC Up/Down 5-minute contracts via the Polymarket Gamma API. Contract IDs are resolved at runtime using a predictable slug format (`btc-updown-5m-{unix_timestamp}` aligned to 300-second boundaries), so no manual lookup is required.
+
+On each rotation, the strategy suppresses signals for the outgoing startup window (where the true opening price is unknown) and captures the first Binance spot tick after the new window opens as the live strike price.
 
 To override with a specific contract, set `POLY_CONDITION_ID`, `POLY_TOKEN_ID_YES`, and `POLY_TOKEN_ID_NO` in `.env`. To browse available markets manually:
 

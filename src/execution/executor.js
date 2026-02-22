@@ -125,22 +125,23 @@ export class Executor {
     const monitor = setInterval(async () => {
       const age = Date.now() - trade.openTime;
 
-      // Get current contract price from the feed
-      const currentBook = this.poly.lastBook;
-      if (!currentBook) return;
-
-      const currentMid = currentBook.mid;
+      // Fetch this position's specific token book directly so that market
+      // rotation (which updates lastBook to the new market) doesn't corrupt P&L.
+      let currentMid;
+      try {
+        const currentBook = await this.poly.fetchOrderbook(trade.signal.tokenId);
+        if (!currentBook || currentBook.bestBid === 0 && currentBook.bestAsk === 1) return;
+        currentMid = currentBook.mid;
+      } catch {
+        return; // skip this check, retry next interval
+      }
       const entryPrice = trade.entryPrice;
 
       // Calculate unrealized P&L
-      let unrealizedPnl;
-      if (trade.direction === "BUY_YES") {
-        // Bought YES: profit if contract price rises
-        unrealizedPnl = (currentMid - entryPrice) * (trade.size / entryPrice);
-      } else {
-        // Bought NO: profit if contract price falls
-        unrealizedPnl = (entryPrice - currentMid) * (trade.size / (1 - entryPrice));
-      }
+      // entryPrice is the token's ask at entry (YES ask for BUY_YES, NO ask for BUY_NO).
+      // currentMid is the same token's current mid (fetched via fetchOrderbook above).
+      // Contracts held = trade.size / entryPrice; profit = price movement × contracts.
+      const unrealizedPnl = (currentMid - entryPrice) * (trade.size / entryPrice);
 
       const pnlPct = unrealizedPnl / trade.size;
 
@@ -167,8 +168,13 @@ export class Executor {
       }
 
       // Contract caught up to model (edge collapsed) — main exit
-      // This is the primary arb resolution: Polymarket price adjusts
-      if (Math.abs(currentMid - trade.signal.modelProb) < 0.02) {
+      // This is the primary arb resolution: Polymarket price adjusts.
+      // For BUY_YES: currentMid is YES price; compare directly to modelProb.
+      // For BUY_NO:  currentMid is NO price; edge collapses when NO ≈ 1 - modelProb.
+      const targetPrice = trade.direction === "BUY_YES"
+        ? trade.signal.modelProb
+        : 1 - trade.signal.modelProb;
+      if (Math.abs(currentMid - targetPrice) < 0.02) {
         shouldExit = true;
         exitReason = "EDGE_COLLAPSED";
       }
@@ -180,17 +186,15 @@ export class Executor {
     }, checkInterval);
 
     // Safety: always exit after max hold
-    setTimeout(() => {
+    setTimeout(async () => {
       clearInterval(monitor);
       if (this.openOrders.has(trade.id)) {
-        const currentBook = this.poly.lastBook;
-        const currentMid = currentBook?.mid || trade.entryPrice;
-        let pnl;
-        if (trade.direction === "BUY_YES") {
-          pnl = (currentMid - trade.entryPrice) * (trade.size / trade.entryPrice);
-        } else {
-          pnl = (trade.entryPrice - currentMid) * (trade.size / (1 - trade.entryPrice));
-        }
+        let currentMid = trade.entryPrice; // fallback
+        try {
+          const currentBook = await this.poly.fetchOrderbook(trade.signal.tokenId);
+          if (currentBook) currentMid = currentBook.mid;
+        } catch { /* use fallback */ }
+        const pnl = (currentMid - trade.entryPrice) * (trade.size / trade.entryPrice);
         this._exitPosition(trade, pnl, "FORCE_EXIT", currentMid);
       }
     }, maxHoldMs + 5000);

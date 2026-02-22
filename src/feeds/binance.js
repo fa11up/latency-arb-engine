@@ -51,6 +51,7 @@ export class BinanceFeed {
     this.ws.on("open", () => {
       this.connected = true;
       this.reconnectDelay = 1000;
+      this.connectedAt = Date.now();
       log.info("Connected to Binance depth stream");
     });
 
@@ -140,9 +141,12 @@ export class BinanceFeed {
   }
 
   getStats() {
+    const uptimeSec = this.connectedAt ? (Date.now() - this.connectedAt) / 1000 : 0;
+    const msgRate = uptimeSec > 0 ? (this.messageCount / uptimeSec).toFixed(1) : "0";
     return {
       connected: this.connected,
       messageCount: this.messageCount,
+      msgRate,
       lastMessageAge: Date.now() - this.lastMessageTime,
       lastMid: this.lastMid,
     };

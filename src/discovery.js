@@ -52,8 +52,12 @@ export class MarketDiscovery {
         return null;
       }
 
-      const tokenIds = data.clobTokenIds;
-      if (!tokenIds || tokenIds.length < 2) {
+      // clobTokenIds is returned as a JSON-encoded string by the Gamma API
+      let tokenIds = data.clobTokenIds;
+      if (typeof tokenIds === "string") {
+        try { tokenIds = JSON.parse(tokenIds); } catch { tokenIds = null; }
+      }
+      if (!Array.isArray(tokenIds) || tokenIds.length < 2) {
         log.warn(`Market ${slug} missing clobTokenIds`);
         return null;
       }

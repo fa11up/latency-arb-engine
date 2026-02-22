@@ -170,10 +170,14 @@ export class PolymarketFeed {
     });
 
     this.ws.on("message", (raw) => {
+      this.messageCount++;
+      this.lastUpdateTime = Date.now();
+      const text = raw.toString();
+      // Polymarket WS sends plain-text responses (e.g. "INVALID OPERATION") for
+      // rejected commands — skip anything that isn't JSON.
+      if (text[0] !== "{" && text[0] !== "[") return;
       try {
-        this.messageCount++;
-        this.lastUpdateTime = Date.now();
-        const msg = JSON.parse(raw.toString());
+        const msg = JSON.parse(text);
         this._processMessage(msg);
       } catch (err) {
         log.error("Failed to parse Polymarket message", { error: err.message });
@@ -241,7 +245,30 @@ export class PolymarketFeed {
   _processMessage(msg) {
     // Polymarket WS message types vary — handle book updates and trade events
     if (msg.event_type === "book" || msg.type === "book") {
-      const book = this._parseBook(msg, 0);
+      const assetId = msg.asset_id;
+      let book;
+
+      if (assetId && assetId === this.tokenIdNo) {
+        // NO token update: invert prices to YES-equivalent before emitting.
+        // NO_bid ↔ YES_ask (inverted), NO_ask ↔ YES_bid (inverted).
+        const raw = this._parseBook(msg, 0);
+        book = {
+          bestBid: raw.bestAsk > 0 ? parseFloat((1 - raw.bestAsk).toFixed(4)) : 0,
+          bestAsk: raw.bestBid > 0 ? parseFloat((1 - raw.bestBid).toFixed(4)) : 1,
+          mid: parseFloat((1 - raw.mid).toFixed(4)),
+          spread: raw.spread,
+          bids: [],
+          asks: [],
+          bidDepth: raw.askDepth,
+          askDepth: raw.bidDepth,
+          timestamp: raw.timestamp,
+          lag: raw.lag,
+        };
+      } else {
+        // YES token update (or unknown): use as-is
+        book = this._parseBook(msg, 0);
+      }
+
       this.lastBook = book;
       this.emit("book", book);
     } else if (msg.event_type === "trade" || msg.type === "last_trade_price") {

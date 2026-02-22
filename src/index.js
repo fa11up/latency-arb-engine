@@ -110,15 +110,18 @@ class ArbEngine {
 
     log.info("Connecting Polymarket CLOB feed...");
     if (this.polymarket.tokenIdYes) {
-      // Try WebSocket first, fall back to polling
+      // Connect WS for low-latency updates
       this.polymarket.connectWs();
 
-      // Also start polling as backup (Polymarket WS can be unreliable)
+      // Always start REST polling as baseline — WS can connect but deliver no book data
+      // (Polymarket WS sends deltas only; REST guarantees a fresh snapshot each second)
       setTimeout(() => {
-        if (!this.polymarket.connected) {
-          log.warn("Polymarket WS not connected — falling back to REST polling");
-          this.polymarket.startPolling(this.polymarket.tokenIdYes, 1000);
+        if (!this.polymarket.lastBook) {
+          log.warn("No Polymarket book data received after 5s — starting REST polling");
+        } else {
+          log.info("Polymarket WS delivering book data — starting REST polling as backup");
         }
+        this.polymarket.startPolling(this.polymarket.tokenIdYes, 1000);
       }, 5000);
     } else {
       log.warn("No Polymarket token ID available — running in monitor-only mode");
@@ -202,8 +205,8 @@ class ArbEngine {
 
     console.log(`
 \x1b[2m─── STATUS (uptime: ${uptime}m) ──────────────────────────────────────\x1b[0m
-  \x1b[36mFeeds\x1b[0m      Binance: ${bStats.connected ? "\x1b[32m●\x1b[0m" : "\x1b[31m●\x1b[0m"} ${bStats.messageCount} msgs   Poly: ${pStats.connected ? "\x1b[32m●\x1b[0m" : "\x1b[31m●\x1b[0m"} ${pStats.messageCount} msgs (${pStats.avgRestLatency}ms avg)
-  \x1b[36mMarket\x1b[0m     Spot: $${sStats.spotPrice?.toFixed(1) || "—"}   Contract: ${sStats.contractMid ? (sStats.contractMid * 100).toFixed(1) + "¢" : "—"}   Lag: ${sStats.feedLag}ms
+  \x1b[36mFeeds\x1b[0m      Binance: ${bStats.connected ? "\x1b[32m●\x1b[0m" : "\x1b[31m●\x1b[0m"} ${bStats.messageCount} msgs (${bStats.msgRate}/s)   Poly: ${pStats.connected ? "\x1b[32m●\x1b[0m" : "\x1b[31m●\x1b[0m"} ${pStats.messageCount} msgs   REST: ${pStats.avgRestLatency}ms avg   Book: ${pStats.lastBook ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"}
+  \x1b[36mMarket\x1b[0m     Spot: $${sStats.spotPrice?.toFixed(1) || "—"}   Strike: ${sStats.strikePrice ? "$" + sStats.strikePrice.toFixed(1) : "—"}   Contract: ${sStats.contractMid ? (sStats.contractMid * 100).toFixed(1) + "¢" : "—"}   Lag: ${sStats.feedLag != null ? sStats.feedLag + "ms" : "—"}
   \x1b[36mStrategy\x1b[0m   Edge: ${sStats.edge ? (sStats.edge * 100).toFixed(1) + "%" : "—"}   Model: ${sStats.modelProb ? (sStats.modelProb * 100).toFixed(1) + "%" : "—"}   Vol: ${(sStats.realizedVol * 100).toFixed(2)}%   Signals: ${sStats.signalCount}
   \x1b[36mRisk\x1b[0m       Bankroll: $${rStats.bankroll.toFixed(2)}   Drawdown: ${rStats.drawdownPct}   Open: ${rStats.openPositions}/${CONFIG.risk.maxOpenPositions}   Daily: $${rStats.dailyPnl.toFixed(2)}
   \x1b[36mExecution\x1b[0m  Filled: ${eStats.fillRate.filled}/${eStats.fillRate.attempted}   Win: ${(eStats.last20WinRate * 100).toFixed(0)}%   Avg latency: ${eStats.avgExecutionLatency}ms

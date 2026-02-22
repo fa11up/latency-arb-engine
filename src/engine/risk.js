@@ -100,8 +100,14 @@ export class RiskManager {
       }
     }
 
+    const allowed = reasons.length === 0;
+
+    // Reserve the cooldown slot immediately so concurrent signals don't
+    // all slip through before the first order's openPosition() call.
+    if (allowed) this.lastTradeTime = Date.now();
+
     return {
-      allowed: reasons.length === 0,
+      allowed,
       reasons,
       drawdown,
       openCount: this.openPositions.size,
