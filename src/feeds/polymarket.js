@@ -341,7 +341,6 @@ export class PolymarketFeed {
         status: result.status || "OPEN",
         avgPrice: result.avgPrice ?? result.fillPrice ?? null,
         timestamp: Date.now(),
-        raw: result,
       };
     } catch (err) {
       log.error("Order placement failed", { error: err.message, body });

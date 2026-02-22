@@ -35,7 +35,6 @@ export const CONFIG = Object.freeze({
     apiKey: env("POLY_API_KEY", ""),
     apiSecret: env("POLY_API_SECRET", ""),
     apiPassphrase: env("POLY_API_PASSPHRASE", ""),
-    proxyWallet: env("POLY_PROXY_WALLET", ""),
     privateKey: env("POLY_PRIVATE_KEY", ""),
     restUrl: "https://clob.polymarket.com",
     wsUrl: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
@@ -45,6 +44,7 @@ export const CONFIG = Object.freeze({
   // ─── Binance ──────────────────────────────────────────────────────
   binance: {
     wsUrl: "wss://stream.binance.us:9443/ws",
+    restUrl: "https://api.binance.us",
     depthLevel: "depth20@100ms",
   },
 
@@ -65,8 +65,18 @@ export const CONFIG = Object.freeze({
   // open from the first Binance tick (proxy for the Chainlink BTC/USD CEX
   // aggregated price that Polymarket uses for contract resolution).
   strategy: {
-    entryThreshold: envNum("ENTRY_THRESHOLD", 0.03),
-    dailyVol: 0.015,  // 1.5% BTC daily vol assumption — tune to realized
+    entryThreshold: envNum("ENTRY_THRESHOLD", 0.08),       // short windows (5m)
+    entryThresholdLong: envNum("ENTRY_THRESHOLD_15M", 0.04), // long windows (15m+): raised 3%→4% to reduce borderline-edge noise
+    // Per-asset daily vol fallbacks — used as the Black-Scholes sigma seed until the
+    // realized-vol EMA warms up (~20s after window open). Tune to 30-day realized vol.
+    // Higher vol → wider probability distribution → smaller edge on out-of-the-money moves.
+    // Using BTC vol for XRP/SOL was producing 20-24% phantom edge on normal intraday moves.
+    volMap: {
+      BTC: envNum("BTC_VOL", 0.015),  // BTC ~1.5% daily
+      ETH: envNum("ETH_VOL", 0.020),  // ETH ~2.0% daily
+      SOL: envNum("SOL_VOL", 0.030),  // SOL ~3.0% daily
+      XRP: envNum("XRP_VOL", 0.035),  // XRP ~3.5% daily
+    },
     // Certainty-arb mode: trades in the last 90s as outcome approaches certainty.
     // Higher threshold required — book is thin and execution risk is elevated.
     certaintyThreshold: envNum("CERTAINTY_THRESHOLD", 0.15),
@@ -84,7 +94,7 @@ export const CONFIG = Object.freeze({
     feeBps: envNum("FEE_BPS", 20),
     maxDrawdownPct: 0.25,  // kill switch at 25% drawdown
     dailyLossLimit: envNum("DAILY_LOSS_LIMIT", 50),
-    profitTargetPct: envNum("PROFIT_TARGET_PCT", 0.03),
+    profitTargetPct: envNum("PROFIT_TARGET_PCT", 0.08),
     stopLossPct: envNum("STOP_LOSS_PCT", 0.15),
   },
 
@@ -116,8 +126,12 @@ export function validateConfig() {
     errors.push("MAX_BET_FRACTION > 10% is suicidal — capping at 10%");
   }
 
-  if (CONFIG.strategy.entryThreshold < 0.03) {
-    errors.push("ENTRY_THRESHOLD < 3% leaves no room for slippage + fees");
+  if (CONFIG.strategy.entryThreshold < 0.05) {
+    errors.push("ENTRY_THRESHOLD < 5% leaves no room for slippage + fees");
+  }
+
+  if (CONFIG.strategy.entryThresholdLong < 0.03) {
+    errors.push("ENTRY_THRESHOLD_15M < 3% leaves no room for slippage + fees");
   }
 
   if (CONFIG.risk.profitTargetPct <= 0 || CONFIG.risk.profitTargetPct >= 1) {

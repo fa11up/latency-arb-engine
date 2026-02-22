@@ -54,9 +54,15 @@ Key classes and their roles:
 
 All config is via `.env` (see `.env.example`). Loaded in `config.js` using `dotenv`. Config validation runs on startup and halts in live mode if Polymarket API keys are missing.
 
-Key parameters: `ASSETS` (comma-separated, default `BTC`), `WINDOWS` (comma-separated minutes, default `5`), `BANKROLL` (default 1300), `ENTRY_THRESHOLD` (default 3%), `CERTAINTY_THRESHOLD` (default 15%), `CERTAINTY_MAX_FRACTION` (default 2%), `MAX_BET_FRACTION` (max 10%), `MAX_OPEN_POSITIONS` (default 8), `DAILY_LOSS_LIMIT` (default $50), `PROFIT_TARGET_PCT` (default 3%), `STOP_LOSS_PCT` (default 15%), `ORDER_TYPE` (default GTC), `DRY_RUN`.
+Key parameters: `ASSETS` (comma-separated, default `BTC`), `WINDOWS` (comma-separated minutes, default `5`), `BANKROLL` (default 1300), `ENTRY_THRESHOLD` (default 5%, applied to 5m markets), `ENTRY_THRESHOLD_15M` (default 3%, applied to 15m+ markets — lower because 15m contracts stay near 50¢ longer with better depth), `CERTAINTY_THRESHOLD` (default 15%), `CERTAINTY_MAX_FRACTION` (default 2%), `MAX_BET_FRACTION` (max 10%), `MAX_OPEN_POSITIONS` (default 8), `DAILY_LOSS_LIMIT` (default $50), `PROFIT_TARGET_PCT` (default 3%), `STOP_LOSS_PCT` (default 15%), `ORDER_TYPE` (default GTC), `DRY_RUN`.
+
+**Per-asset volatility:** `BTC_VOL` (default 1.5%), `ETH_VOL` (default 2.0%), `SOL_VOL` (default 3.0%), `XRP_VOL` (default 3.5%). Used as the Black-Scholes sigma seed until the realized-vol EMA warms up (~20 ticks after window open). Using BTC vol for all assets produced 20-24% phantom edge on XRP/SOL normal intraday moves. Tune to 30-day realized vol for each asset.
+
+**Kill switch baseline:** `peakBankroll` is **not restored** across sessions. On every startup, `peakBankroll` is reset to the current `bankroll`. This gives each session a fresh 25% drawdown buffer — restoring the historical peak would cause the kill switch to trip immediately after any prior losing session. `bankroll` is still fully persisted and restored.
 
 **Per-market position limit:** The signal handler in `ArbEngine` rejects a new signal if that market already has an open position (`executor.openOrders.values()` filtered by `t.signal.label === signal.label`). This prevents stacking multiple concurrent positions in the same direction on one market, which is the most common cause of compounding stop-loss losses.
+
+**Certainty-arb price guard:** `_evaluateCertainty` skips entry if the token side we'd buy is already below `CERTAINTY_MIN_PRICE` (15¢). At those prices (e.g. buying NO when YES is at 87¢) the market has already committed to the outcome — BS vol calibrated to 30-day realized vol underestimates near-expiry resolution certainty and the apparent edge is phantom. Without this guard, stop-loss → cooldown → re-entry cascades occur as the losing token collapses toward zero.
 
 Contract IDs are auto-discovered via Gamma API — no manual config needed. Strike price is captured dynamically at each window open — not a config value.
 
@@ -74,6 +80,9 @@ Rather than magic numbers, timing values are named constants at the top of each 
 | `MAX_TRADE_HISTORY` | 500 | executor.js |
 | `CERTAINTY_WINDOW_SECS` | 90 | strategy.js |
 | `MIN_EXPIRY_BUFFER_MS` | 5000 | strategy.js |
+| `MODEL_SATURATION_THRESHOLD` | 0.90 | strategy.js |
+| `STALE_CONTRACT_MAX_MS` | 5000 | strategy.js |
+| `CERTAINTY_MIN_PRICE` | 0.15 | strategy.js |
 | `POLL_START_DELAY_MS` | 5000 | index.js |
 | `SAVE_INTERVAL_MS` | 30000 | index.js |
 

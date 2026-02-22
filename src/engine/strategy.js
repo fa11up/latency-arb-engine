@@ -5,8 +5,18 @@ import { impliedProbability, calculateEdge, calculatePositionSize, RunningStats,
 const log = createLogger("STRATEGY");
 
 // ─── SIGNAL CONSTANTS ──────────────────────────────────────────────────────────
-const CERTAINTY_WINDOW_SECS = 90;    // switch to certainty-arb mode in last N seconds
-const MIN_EXPIRY_BUFFER_MS  = 5_000; // don't enter a trade if < 5s to expiry
+const CERTAINTY_WINDOW_SECS      = 90;    // switch to certainty-arb mode in last N seconds
+const MIN_EXPIRY_BUFFER_MS       = 5_000; // don't enter a trade if < 5s to expiry
+const MODEL_SATURATION_THRESHOLD = 0.90;  // suppress latency-arb signals when N(d2) > 90%
+                                           // (tiny-T singularity: oracle uses ~1-min TWAP,
+                                           //  not spot tick — apparent edge is not real)
+const STALE_CONTRACT_MAX_MS      = 5_000; // suppress signals when contract data is > 5s stale
+                                           // (REST poll failures freeze lastContractUpdate while
+                                           //  Binance ticks keep arriving, inflating feedLag)
+const CERTAINTY_MIN_PRICE        = 0.15;  // min price for the token side we'd buy in certainty arb
+                                           // below this the market has already committed to the outcome —
+                                           // BS vol (calibrated to 30-day realized) doesn't capture
+                                           // near-expiry resolution certainty, so apparent edge is phantom
 
 /**
  * Strategy engine.
@@ -110,6 +120,15 @@ export class Strategy {
     this._onSignal = handler;
   }
 
+  /**
+   * Pre-seed the vol EMA with a known daily vol so signals computed in the
+   * first few seconds after startup use a calibrated value rather than zero.
+   * Called by ArbEngine after fetching Binance klines vol at startup.
+   */
+  seedVol(vol) {
+    this.volEma.value = vol;
+  }
+
   /** Inject a live bankroll getter so position sizing uses current capital. */
   setBankrollGetter(fn) {
     this._getBankroll = fn;
@@ -179,9 +198,13 @@ export class Strategy {
     // No strike captured yet (window just opened, waiting for first Binance tick).
     if (!this.marketOpenStrike) return;
 
-    const { entryThreshold, dailyVol } = CONFIG.strategy;
+    // 15m+ windows stay near 50¢ longer and have better book depth — lower threshold is appropriate.
+    const threshold = this.windowMins >= 15
+      ? CONFIG.strategy.entryThresholdLong
+      : CONFIG.strategy.entryThreshold;
     const strikePrice = this.marketOpenStrike;
 
+    const dailyVol = CONFIG.strategy.volMap[this.asset];                                              
     const vol = this.volEma.value || dailyVol;
     const hoursToExpiry = this._estimateHoursToExpiry();
 
@@ -197,13 +220,23 @@ export class Strategy {
 
     // Normal latency-arb (t > 90s)
     const modelProb = impliedProbability(this.spotPrice, strikePrice, vol, hoursToExpiry);
+
+    // Model saturation guard: when N(d2) > 90% outside the certainty window, the BS
+    // formula is in a tiny-T singularity (spot far from strike, little time left). The
+    // Chainlink oracle resolves against a ~1-min TWAP, not spot tick — the apparent edge
+    // is not real and books are too thin to fill anyway.
+    if (modelProb > MODEL_SATURATION_THRESHOLD) return;
+
     const edge = calculateEdge(modelProb, this.contractMid);
     const smoothedEdge = this.edgeEma.update(edge.absolute);
     this.edgeStats.push(edge.absolute);
 
     const feedLag = Math.abs(this.lastSpotUpdate - this.lastContractUpdate);
+    // Beyond STALE_CONTRACT_MAX_MS the lag reflects a polling failure (REST error / 429 exhausted),
+    // not genuine Polymarket repricing — the book we see is frozen, not lagging.
+    if (feedLag > STALE_CONTRACT_MAX_MS) return;
     const isStale = feedLag > 1000; // contract at least 1s behind spot
-    const edgeConfirmed = smoothedEdge >= entryThreshold && edge.absolute >= entryThreshold;
+    const edgeConfirmed = smoothedEdge >= threshold && edge.absolute >= threshold;
 
     if (edgeConfirmed && isStale && this._onSignal) {
       this._fireSignal({ edge, modelProb, smoothedEdge, feedLag, vol, hoursToExpiry, isCertainty: false });
@@ -225,6 +258,17 @@ export class Strategy {
     // Track edge even in certainty mode
     this.edgeStats.push(edge.absolute);
     this.edgeEma.update(edge.absolute);
+
+    // Don't enter if the market has already priced in the certainty.
+    // When the token we'd buy is below CERTAINTY_MIN_PRICE (e.g. NO at 12¢ while market
+    // prices YES at 88¢), the book has committed to the outcome. The BS vol model is
+    // calibrated to 30-day realized vol and underestimates near-expiry resolution
+    // certainty — the apparent edge is phantom, and each entry gets stop-lossed as the
+    // losing token collapses toward zero.
+    const tokenSidePrice = edge.direction === "BUY_YES"
+      ? this.contractMid
+      : 1 - this.contractMid;
+    if (tokenSidePrice < CERTAINTY_MIN_PRICE) return;
 
     // Require large edge — the book is thin and execution slippage is elevated
     if (edge.absolute < certaintyThreshold) return;
@@ -331,7 +375,7 @@ export class Strategy {
 
   // ─── STATUS ─────────────────────────────────────────────────────────
   getStatus() {
-    const { dailyVol } = CONFIG.strategy;
+    const dailyVol = CONFIG.strategy.volMap[this.asset]
     const strikePrice = this.marketOpenStrike; // null until window opens
     const vol = this.volEma.value || dailyVol;
     const hoursToExpiry = this._estimateHoursToExpiry();

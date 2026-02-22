@@ -15,7 +15,6 @@ const log = createLogger("RISK");
  */
 export class RiskManager {
   constructor() {
-    this.startBankroll = CONFIG.risk.bankroll;
     this.bankroll = CONFIG.risk.bankroll;
     this.peakBankroll = CONFIG.risk.bankroll;
     this.openPositions = new Map(); // id → position
@@ -195,9 +194,13 @@ export class RiskManager {
    * Open positions are restored here so closePosition() can find them by ID
    * when the executor's monitors eventually exit them.
    */
-  restoreState({ bankroll, peakBankroll, dailyPnl, dailyTrades, dailyResetTime, openPositions } = {}) {
+  restoreState({ bankroll, dailyPnl, dailyTrades, dailyResetTime, openPositions } = {}) {
     if (bankroll != null) this.bankroll = bankroll;
-    if (peakBankroll != null) this.peakBankroll = peakBankroll;
+    // peakBankroll is intentionally NOT restored. The kill switch is per-session:
+    // each restart begins with a fresh 25% drawdown buffer from the current bankroll.
+    // Restoring the historical peak would make the kill switch trip almost immediately
+    // if the prior session ended in a loss.
+    this.peakBankroll = this.bankroll;
     if (dailyPnl != null) this.dailyPnl = dailyPnl;
     if (dailyTrades != null) this.dailyTrades = dailyTrades;
     if (dailyResetTime != null) this.dailyResetTime = dailyResetTime;
@@ -208,6 +211,7 @@ export class RiskManager {
 
     log.info("Risk state restored", {
       bankroll: this.bankroll.toFixed(2),
+      peakBankroll: this.peakBankroll.toFixed(2),
       dailyPnl: this.dailyPnl.toFixed(2),
       openPositions: this.openPositions.size,
     });

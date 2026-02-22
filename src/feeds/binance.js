@@ -124,6 +124,48 @@ export class BinanceFeed {
     this.emit("price", priceData);
   }
 
+  /**
+   * Fetch realized daily vol from recent 1-minute klines.
+   * Uses the last `minutes` 1m candles to compute std(log_returns) * sqrt(1440).
+   * Public endpoint — no auth required.
+   * Returns daily vol as a fraction (e.g. 0.018 = 1.8%), or null on failure.
+   */
+  async fetchRecentVol(minutes = 60) {
+    const symbol = this.symbol.toUpperCase();
+    const url = `${CONFIG.binance.restUrl}/api/v3/klines?symbol=${symbol}&interval=1m&limit=${minutes + 1}`;
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const klines = await resp.json();
+      if (!Array.isArray(klines) || klines.length < 2) throw new Error("Insufficient kline data");
+
+      const closes = klines.map(k => parseFloat(k[4]));
+      const logReturns = closes.slice(1).map((c, i) => Math.log(c / closes[i]));
+      const mean = logReturns.reduce((a, b) => a + b, 0) / logReturns.length;
+      const variance = logReturns.reduce((a, b) => a + (b - mean) ** 2, 0) / (logReturns.length - 1);
+      const dailyVol = Math.sqrt(variance) * Math.sqrt(1440); // 1440 minutes per day
+
+      log.info(`Vol seed from ${minutes}m klines`, {
+        symbol,
+        dailyVol: `${(dailyVol * 100).toFixed(2)}%`,
+        candles: klines.length - 1,
+      });
+      return dailyVol;
+    } catch (err) {
+      log.warn(`Could not fetch klines for vol seed — using config default`, { symbol, error: err.message });
+      return null;
+    }
+  }
+
+  /**
+   * Pre-seed the absDeltaEma so the feed emits a non-zero realizedVol
+   * from the very first tick instead of bootstrapping from scratch.
+   * vol is a daily vol fraction (e.g. 0.018); we reverse-annualize to per-tick.
+   */
+  seedVol(vol) {
+    this.absDeltaEma.value = vol / Math.sqrt(864000);
+  }
+
   _reconnect() {
     log.info(`Reconnecting in ${this.reconnectDelay}ms...`);
     setTimeout(() => {

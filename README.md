@@ -36,8 +36,8 @@ Exploits the 3-7 second lag between Binance spot price updates and Polymarket CL
 3. **Edge detection**: compare model prob vs Polymarket contract mid
 4. **Signal guards**: suppress startup window and pre-window signals; route last 90s to certainty-arb mode
 5. **Signal generation** (two modes):
-   - *Latency-arb* (t > 90s): edge > 3% AND contract stale >1s behind spot
-   - *Certainty-arb* (0 < t ≤ 90s): edge > 15% as outcome approaches certainty; half-size; force-exits before expiry
+   - *Latency-arb* (t > 90s): edge > 5% (5m) / 3% (15m) AND contract stale >1s; blocked when N(d2) > 90% (model saturation) or feedLag > 5s (stale REST data)
+   - *Certainty-arb* (0 < t ≤ 90s): edge > 15% as outcome approaches certainty; half-size; force-exits before expiry; skips if token-side price < 15¢ (phantom edge guard)
 6. **Risk check**: position limits, drawdown, cooldown, liquidity
 7. **Execution**: place order on Polymarket CLOB; poll for fill confirmation
 8. **Monitoring**: track position, exit on edge collapse / timeout / stop loss / expiry
@@ -71,20 +71,25 @@ All configuration is in `.env`. Key parameters:
 | `ASSETS` | `BTC` | Comma-separated assets to monitor (BTC, ETH, SOL, XRP) |
 | `WINDOWS` | `5` | Comma-separated window sizes in minutes (5, 15) |
 | `BANKROLL` | 1300 | Starting capital in USD |
-| `ENTRY_THRESHOLD` | 0.03 | Minimum edge (3%) to enter a latency-arb trade |
+| `ENTRY_THRESHOLD` | 0.05 | Minimum edge (5%) for 5m latency-arb trades (raised — thin books near noise floor) |
+| `ENTRY_THRESHOLD_15M` | 0.03 | Minimum edge (3%) for 15m trades (lower — more liquidity near 50¢) |
 | `CERTAINTY_THRESHOLD` | 0.15 | Minimum edge (15%) for certainty-arb in last 90s |
 | `CERTAINTY_MAX_FRACTION` | 0.02 | Kelly cap for certainty-arb positions (2% of bankroll) |
 | `MAX_BET_FRACTION` | 0.04 | Kelly fraction cap (4% of bankroll) |
 | `MAX_POSITION_USD` | 100 | Max USD per single trade |
 | `MAX_OPEN_POSITIONS` | 8 | Concurrent position limit |
 | `DAILY_LOSS_LIMIT` | 50 | Stop trading after this many USD lost in a day |
-| `PROFIT_TARGET_PCT` | 0.03 | Exit a position when it reaches 3% profit |
-| `STOP_LOSS_PCT` | 0.50 | Exit a position at 50% loss |
+| `PROFIT_TARGET_PCT` | 0.08 | Exit a position when it reaches 8% profit |
+| `STOP_LOSS_PCT` | 0.15 | Exit a position at 15% loss |
 | `COOLDOWN_MS` | 3000 | Minimum ms between trades (stamped atomically) |
 | `SLIPPAGE_BPS` | 15 | Expected slippage in basis points |
 | `FEE_BPS` | 20 | Polymarket fee in basis points |
 | `ORDER_TYPE` | GTC | Order type (GTC = Good Till Cancelled) |
 | `DRY_RUN` | true | Paper trading mode — no real orders placed |
+| `BTC_VOL` | 0.015 | BTC daily vol seed for Black-Scholes sigma (1.5%) |
+| `ETH_VOL` | 0.020 | ETH daily vol seed (2.0%) |
+| `SOL_VOL` | 0.030 | SOL daily vol seed (3.0%) |
+| `XRP_VOL` | 0.035 | XRP daily vol seed (3.5%) |
 
 ## Risk Controls
 
@@ -94,6 +99,10 @@ All configuration is in `.env`. Key parameters:
 - **Position Limits**: Max concurrent positions and per-trade USD cap; per-market stacking prevented
 - **Cooldown**: Minimum ms between trades, stamped atomically in `canTrade()` to prevent races
 - **Liquidity Check**: Rejects signals if available book depth is below position size; relaxed threshold for certainty-arb
+- **Model Saturation Guard**: Suppresses latency-arb signals when N(d2) > 90% — in tiny-T regime the Chainlink oracle's ~1-min TWAP means apparent edge is not real
+- **Stale Contract Guard**: Suppresses signals when feedLag > 5s — beyond that the lag reflects a REST polling failure, not genuine Polymarket repricing
+- **Certainty-Arb Price Guard**: Skips certainty entry if the token side we'd buy is below 15¢ — at those prices the market has committed to the outcome and BS vol underestimates near-expiry certainty, producing phantom edge
+- **Per-Asset Vol Calibration**: Each asset uses its own daily vol seed (`BTC_VOL` … `XRP_VOL`) pre-seeded from recent 1m Binance klines at startup, preventing phantom 20-24% edge on high-vol assets from BTC vol assumptions
 - **Unhandled Rejection Kill Switch**: 5+ unhandled promise rejections in a 60s sliding window halts trading
 - **Shutdown Accounting**: On shutdown, open positions are marked to current book mid (`estimated: true`) — no forced break-even
 
@@ -132,6 +141,9 @@ src/
 
 tests/
 └── executor.test.js         # 24 tests (node:test built-in)
+
+.claude/skills/audit/
+└── SKILL.md                 # /audit skill — runs dry-mode analysis and generates a structured report
 ```
 
 ## Tests

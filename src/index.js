@@ -49,6 +49,9 @@ class ArbEngine {
       strategy: new Strategy(asset, windowMins),
       discovery: new MarketDiscovery(asset, windowMins),
       activeMarket: null,
+      // Track first-occurrence rejection reasons per window — log.info on first hit,
+      // log.debug on repeats so the log stays scannable without losing signal.
+      _seenBlockReasons: new Set(),
     }));
 
     // Shared across all markets
@@ -131,11 +134,31 @@ class ArbEngine {
         // on a potentially wrong directional bet.
         const hasOpenForMarket = [...this.executor.openOrders.values()]
           .some(t => t.signal.label === signal.label);
-        if (hasOpenForMarket) return;
+        if (hasOpenForMarket) {
+          const key = "open_position";
+          if (!market._seenBlockReasons.has(key)) {
+            market._seenBlockReasons.add(key);
+            log.info(`[${signal.label}] Signal blocked: market already has open position`);
+          }
+          return;
+        }
 
         const check = this.risk.canTrade(signal);
         if (!check.allowed) {
-          log.debug(`[${signal.label}] Signal rejected`, { reasons: check.reasons });
+          // Log each unique rejection category once per window at info level;
+          // subsequent identical rejections go to debug to avoid log spam.
+          for (const reason of check.reasons) {
+            const key = reason.split(":")[0]; // e.g. "Cooldown", "Insufficient liquidity"
+            if (!market._seenBlockReasons.has(key)) {
+              market._seenBlockReasons.add(key);
+              log.info(`[${signal.label}] Signal blocked: ${reason}`, {
+                edge: `${(signal.edge * 100).toFixed(1)}%`,
+                size: `$${signal.size?.toFixed(2)}`,
+              });
+            } else {
+              log.debug(`[${signal.label}] Signal blocked (repeat): ${reason}`);
+            }
+          }
           return;
         }
         await this.executor.execute(signal);
@@ -145,6 +168,23 @@ class ArbEngine {
     // ─── Discover active markets ─────────────────────────────────────
     log.info(`Discovering ${this.markets.length} active market(s)...`);
     await Promise.all(this.markets.map(m => this._initMarket(m)));
+
+    // ─── Seed vol from recent Binance klines ────────────────────────
+    // Fetch realized daily vol from 1m klines for each asset before the WS
+    // connects. Pre-seeds both the feed's absDeltaEma and each strategy's
+    // volEma so the model uses accurate vol from the very first tick instead
+    // of bootstrapping from zero. Falls back to per-asset config defaults on failure.
+    log.info("Seeding vol from Binance klines...");
+    await Promise.all([...this.binanceFeeds.entries()].map(async ([symbol, feed]) => {
+      const asset = this.markets.find(m => m.symbol === symbol)?.asset;
+      const fallbackVol = CONFIG.strategy.volMap[asset] ?? CONFIG.strategy.volMap.BTC;
+      const klineVol = await feed.fetchRecentVol();
+      const vol = klineVol ?? fallbackVol;
+      feed.seedVol(vol);
+      for (const m of this.markets.filter(m => m.symbol === symbol)) {
+        m.strategy.seedVol(vol);
+      }
+    }));
 
     // ─── Connect feeds ──────────────────────────────────────────────
     log.info("Connecting Binance feeds...");
@@ -226,6 +266,9 @@ class ArbEngine {
 
         // Cancel only this market's open orders (not other markets')
         await this.executor.cancelOrdersForLabel(label);
+
+        // Reset per-window rejection tracking so next window logs fresh first-occurrences
+        m._seenBlockReasons.clear();
 
         // Unsubscribe old tokens
         this.polymarket.removeSubscription(m.activeMarket.tokenIdYes, m.activeMarket.tokenIdNo);

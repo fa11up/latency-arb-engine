@@ -45,7 +45,6 @@ export function kellyFraction(winProb, odds, cap = 0.04) {
 // ─── Edge calculation ──────────────────────────────────────────────────────
 export function calculateEdge(modelProb, contractPrice) {
   return {
-    raw: modelProb - contractPrice,
     absolute: Math.abs(modelProb - contractPrice),
     direction: modelProb > contractPrice ? "BUY_YES" : "BUY_NO",
     modelProb,
