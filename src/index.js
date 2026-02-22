@@ -121,14 +121,11 @@ class ArbEngine {
     log.info("Connecting Polymarket CLOB feed...");
     this.polymarket.connectWs();
 
-    // Always start REST polling as baseline for each market's YES token
+    // Start REST polling as baseline for each market's YES token
     // (WS can connect but deliver no book data; REST guarantees fresh snapshots)
     setTimeout(() => {
       for (const m of this.markets) {
         if (m.activeMarket?.tokenIdYes) {
-          const hasBook = !!this.polymarket.lastBook;
-          log.info(`[${m.asset}/${m.windowMins}m] Starting REST polling` +
-            (!hasBook ? " (WS silent — primary)" : " (backup)"));
           this.polymarket.startPolling(m.activeMarket.tokenIdYes, 1000);
         }
       }
@@ -179,13 +176,8 @@ class ArbEngine {
       m.discovery.startRotation(async (newMarket) => {
         log.info(`[${label}] Rotating to: ${newMarket.slug}`);
 
-        // Cancel open orders for this market
-        const openForMarket = [...this.executor.openOrders.values()]
-          .filter(t => t.signal.label === label);
-        if (openForMarket.length > 0) {
-          log.warn(`[${label}] Cancelling ${openForMarket.length} open orders for rotation`);
-          await this.executor.cancelAllOrders();
-        }
+        // Cancel only this market's open orders (not other markets')
+        await this.executor.cancelOrdersForLabel(label);
 
         // Unsubscribe old tokens
         this.polymarket.removeSubscription(m.activeMarket.tokenIdYes, m.activeMarket.tokenIdNo);

@@ -148,9 +148,9 @@ export class MarketDiscovery {
 
     this._rotationTimer = setTimeout(async () => {
       try {
-        // Compute the next window timestamp
-        const endSec = Math.floor(endMs / 1000);
-        const nextTs = this._alignToInterval(endSec) + this.intervalSecs;
+        // The end of the current market IS the start of the next one.
+        // Use Math.round to handle sub-second offsets in endDate from the API.
+        const nextTs = this._alignToInterval(Math.round(endMs / 1000));
 
         log.info(`[${this.asset.toUpperCase()}/${this.windowMins}m] Rotating to next market window: ${nextTs}`);
         const nextMarket = await this.fetchMarket(nextTs);

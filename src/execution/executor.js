@@ -129,8 +129,7 @@ export class Executor {
     const monitor = setInterval(async () => {
       const age = Date.now() - trade.openTime;
 
-      // Fetch this position's specific token book directly so that market
-      // rotation (which updates lastBook to the new market) doesn't corrupt P&L.
+      // Fetch this position's specific token book directly (not shared state).
       let currentMid;
       try {
         const currentBook = await this.poly.fetchOrderbook(trade.signal.tokenId);
@@ -267,6 +266,21 @@ export class Executor {
       log.info("All orders cancelled");
     } catch (err) {
       log.error("Failed to cancel all orders", { error: err.message });
+    }
+  }
+
+  /** Cancel only the orders belonging to a specific market label (e.g. "BTC/5m"). */
+  async cancelOrdersForLabel(label) {
+    const matches = [...this.openOrders.values()].filter(t => t.signal.label === label);
+    if (matches.length === 0) return;
+    log.warn(`Cancelling ${matches.length} order(s) for ${label}`);
+    for (const trade of matches) {
+      try {
+        await this.poly.cancelOrder(trade.id);
+        this.openOrders.delete(trade.id);
+      } catch (err) {
+        log.error(`Failed to cancel order ${trade.id}`, { error: err.message });
+      }
     }
   }
 

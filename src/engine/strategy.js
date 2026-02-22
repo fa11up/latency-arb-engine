@@ -54,10 +54,10 @@ export class Strategy {
     this.edgeStats = new RunningStats();
     this.lagStats = new RunningStats();
 
-    // Active market (set by discovery)
-    this.tokenIdYes = CONFIG.poly.tokenIdYes || null;
-    this.tokenIdNo = CONFIG.poly.tokenIdNo || null;
-    this.marketEndDate = null; // ISO string, set by setMarket()
+    // Active market (set by setMarket on discovery/rotation)
+    this.tokenIdYes = null;
+    this.tokenIdNo = null;
+    this.marketEndDate = null;
 
     // Dynamic strike: spot price at market open (captured on first tick after setMarket)
     // For updown contracts the strike is the opening price, not a fixed level.

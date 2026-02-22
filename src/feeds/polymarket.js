@@ -35,10 +35,6 @@ export class PolymarketFeed {
     this._subscribedTokens = new Set();
     this.noTokenIds = new Set();
 
-    // Legacy single-market token IDs (kept for backwards compat with connectWs auto-sub)
-    this.tokenIdYes = CONFIG.poly.tokenIdYes || null;
-    this.tokenIdNo = CONFIG.poly.tokenIdNo || null;
-
     // Track request timing for lag measurement
     this._restLatencies = [];
     // Map<tokenId, intervalId> for per-market REST polling
@@ -248,8 +244,6 @@ export class PolymarketFeed {
       }
     }
 
-    // Clear stale book data
-    this.lastBook = null;
   }
 
   _processMessage(msg) {
@@ -290,23 +284,6 @@ export class PolymarketFeed {
         side: msg.side || "unknown",
         timestamp: Date.now(),
       });
-    } else if (msg.event_type === "price_change" || msg.type === "price_change") {
-      // Some Polymarket feeds send price change events
-      const price = parseFloat(msg.price || msg.yes_price || 0);
-      if (price > 0) {
-        this.emit("book", {
-          bestBid: price - 0.005,
-          bestAsk: price + 0.005,
-          mid: price,
-          spread: 0.01,
-          bids: [],
-          asks: [],
-          bidDepth: 0,
-          askDepth: 0,
-          timestamp: Date.now(),
-          lag: 0,
-        });
-      }
     }
   }
 

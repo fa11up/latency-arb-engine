@@ -122,7 +122,6 @@ export class RiskManager {
       openTime: Date.now(),
     });
     this.bankroll -= trade.size;
-    this.lastTradeTime = Date.now();
     this.dailyTrades++;
 
     log.info(`Position opened: ${trade.id}`, {

@@ -1,5 +1,5 @@
 // ─── Normal CDF (Abramowitz & Stegun approximation) ────────────────────────
-export function normalCdf(x) {
+function normalCdf(x) {
   const a1 = 0.254829592;
   const a2 = -0.284496736;
   const a3 = 1.421413741;

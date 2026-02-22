@@ -104,32 +104,38 @@ export class TUI {
       `WINDOW{/cyan-fg}{/bold}`;
 
     const rows = markets.map(({ bStats, sStats }) => {
-      const dot      = bStats.connected ? "{green-fg}●{/green-fg}" : "{red-fg}●{/red-fg}";
-      const label    = (sStats.label || "—").padEnd(cols.label - 2);
-      const spot     = (sStats.spotPrice     ? `$${sStats.spotPrice.toFixed(1)}`               : "—").padEnd(cols.spot);
-      const strike   = (sStats.strikePrice   ? `$${sStats.strikePrice.toFixed(1)}`             : "—").padEnd(cols.strike);
-      const mid      = (sStats.contractMid   ? `${(sStats.contractMid * 100).toFixed(1)}¢`     : "—").padEnd(cols.mid);
-      const lagStr   = (sStats.feedLag != null ? `${sStats.feedLag}ms`                         : "—").padEnd(cols.lag);
+      // Pad raw values BEFORE adding color tags — blessed strips tags when
+      // rendering, but JS padEnd() counts tag chars and adds no padding if
+      // the tagged string is already "wide" from JS's perspective.
+      const dot    = bStats.connected ? "{green-fg}●{/green-fg}" : "{red-fg}●{/red-fg}";
+      const label  = (sStats.label || "—").padEnd(cols.label - 2);
+      const spot   = (sStats.spotPrice   ? `$${sStats.spotPrice.toFixed(2)}`           : "—").padEnd(cols.spot);
+      const strike = (sStats.strikePrice ? `$${sStats.strikePrice.toFixed(2)}`         : "—").padEnd(cols.strike);
+      const mid    = (sStats.contractMid ? `${(sStats.contractMid * 100).toFixed(1)}¢` : "—").padEnd(cols.mid);
+      const lagStr = (sStats.feedLag != null ? `${sStats.feedLag}ms`                   : "—").padEnd(cols.lag);
 
-      let edgeStr = "—";
+      // Edge: pad first, color after
+      let edgeStr;
       if (sStats.edge) {
-        const pct = (sStats.edge * 100).toFixed(1) + "%";
-        edgeStr = sStats.edge >= 0.03 ? `{green-fg}${pct}{/green-fg}` : pct;
+        const padded = ((sStats.edge * 100).toFixed(1) + "%").padEnd(cols.edge);
+        edgeStr = sStats.edge >= 0.03 ? `{green-fg}${padded}{/green-fg}` : padded;
+      } else {
+        edgeStr = "—".padEnd(cols.edge);
       }
-      edgeStr = edgeStr.padEnd(cols.edge);
 
-      let countdown = "—";
+      // Countdown to expiry of current window
+      let expiry = "—";
       if (sStats.marketEndDate) {
-        const sec = Math.round((new Date(sStats.marketEndDate) - Date.now()) / 1000);
+        const sec = Math.round((new Date(sStats.marketEndDate).getTime() - Date.now()) / 1000);
         if (sec <= 0) {
-          countdown = "{yellow-fg}expiring{/yellow-fg}";
+          expiry = "{yellow-fg}expiring{/yellow-fg}";
         } else {
           const str = `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
-          countdown = sec < 90 ? `{yellow-fg}${str}{/yellow-fg}` : str;
+          expiry = sec < 90 ? `{yellow-fg}${str}{/yellow-fg}` : str;
         }
       }
 
-      return `${dot} ${label} ${spot} ${strike} ${mid} ${edgeStr} ${lagStr} ${countdown}`;
+      return `${dot} ${label} ${spot} ${strike} ${mid} ${edgeStr} ${lagStr} ${expiry}`;
     });
 
     this.marketsBox.setContent([head, ...rows].join("\n"));

@@ -27,7 +27,6 @@ export class BinanceFeed {
     this.connected = false;
     this.messageCount = 0;
     this.lastMessageTime = 0;
-    this.volatilityEma = new EMA(50); // ~5s of 100ms ticks
     this.absDeltaEma = new EMA(100);  // smoothed absolute delta for vol estimate
   }
 

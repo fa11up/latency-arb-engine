@@ -37,9 +37,6 @@ export const CONFIG = Object.freeze({
     apiPassphrase: env("POLY_API_PASSPHRASE", ""),
     proxyWallet: env("POLY_PROXY_WALLET", ""),
     privateKey: env("POLY_PRIVATE_KEY", ""),
-    conditionId: env("POLY_CONDITION_ID", ""),
-    tokenIdYes: env("POLY_TOKEN_ID_YES", ""),
-    tokenIdNo: env("POLY_TOKEN_ID_NO", ""),
     restUrl: "https://clob.polymarket.com",
     wsUrl: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
     gammaApiUrl: "https://gamma-api.polymarket.com",
@@ -69,7 +66,6 @@ export const CONFIG = Object.freeze({
   // aggregated price that Polymarket uses for contract resolution).
   strategy: {
     entryThreshold: envNum("ENTRY_THRESHOLD", 0.03),
-    minEdge: envNum("MIN_EDGE", 0.03),
     dailyVol: 0.015,  // 1.5% BTC daily vol assumption — tune to realized
     // Certainty-arb mode: trades in the last 90s as outcome approaches certainty.
     // Higher threshold required — book is thin and execution risk is elevated.
@@ -112,7 +108,6 @@ export function validateConfig() {
     if (!CONFIG.poly.apiKey) errors.push("POLY_API_KEY required for live trading");
     if (!CONFIG.poly.apiSecret) errors.push("POLY_API_SECRET required for live trading");
     if (!CONFIG.poly.privateKey) errors.push("POLY_PRIVATE_KEY required for live trading");
-    // conditionId and tokenIds are now auto-discovered via Gamma API
   }
 
   if (CONFIG.risk.maxBetFraction > 0.10) {
