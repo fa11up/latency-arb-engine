@@ -159,6 +159,31 @@ export class RiskManager {
     }
   }
 
+  // ─── CRASH RECOVERY ────────────────────────────────────────────────
+  /**
+   * Restore persisted state from a previous session.
+   * Called before any trading resumes so bankroll/P&L tracking is correct.
+   * Open positions are restored here so closePosition() can find them by ID
+   * when the executor's monitors eventually exit them.
+   */
+  restoreState({ bankroll, peakBankroll, dailyPnl, dailyTrades, dailyResetTime, openPositions } = {}) {
+    if (bankroll != null) this.bankroll = bankroll;
+    if (peakBankroll != null) this.peakBankroll = peakBankroll;
+    if (dailyPnl != null) this.dailyPnl = dailyPnl;
+    if (dailyTrades != null) this.dailyTrades = dailyTrades;
+    if (dailyResetTime != null) this.dailyResetTime = dailyResetTime;
+
+    for (const pos of (openPositions || [])) {
+      this.openPositions.set(pos.id, pos);
+    }
+
+    log.info("Risk state restored", {
+      bankroll: this.bankroll.toFixed(2),
+      dailyPnl: this.dailyPnl.toFixed(2),
+      openPositions: this.openPositions.size,
+    });
+  }
+
   // ─── MANUAL CONTROLS ───────────────────────────────────────────────
   kill(reason) {
     this.killed = true;

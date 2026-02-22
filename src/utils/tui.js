@@ -1,13 +1,15 @@
 import blessed from "blessed";
+import { CONFIG } from "../config.js";
 
 /**
  * Terminal UI — renders a live dashboard using blessed.
  *
  * Layout (top → bottom):
- *   - Header bar      (1 line, no border)
- *   - Markets table   (1 row per active market)
- *   - Risk/stats row  (bankroll, P&L, feeds)
- *   - Log pane        (fills remaining height, scrollable)
+ *   - Header bar        (1 line)
+ *   - Markets table     (1 row per active market)
+ *   - Open trades table (1 row per open position, min 3 lines)
+ *   - Risk/stats row    (bankroll, P&L, feeds)
+ *   - Log pane          (fills remaining height, scrollable)
  *
  * Usage:
  *   const tui = new TUI(marketCount);
@@ -23,9 +25,9 @@ export class TUI {
       fullUnicode: true,
     });
 
-    // Fixed heights for each section
-    const marketsHeight = marketCount + 4; // top/bottom border + col header + N rows
-    const statsHeight   = 5;               // top/bottom border + 3 data rows
+    const marketsHeight = marketCount + 4;        // border×2 + header + N rows
+    const tradesHeight  = CONFIG.risk.maxOpenPositions + 3; // border×2 + header + N rows
+    const statsHeight   = 5;
 
     // ─── Header bar ──────────────────────────────────────────────────
     this.header = blessed.box({
@@ -45,10 +47,21 @@ export class TUI {
       padding: { left: 1, right: 1 },
     });
 
+    // ─── Open trades table ───────────────────────────────────────────
+    this.tradesBox = blessed.box({
+      parent: this.screen,
+      top: 1 + marketsHeight, left: 0, right: 0, height: tradesHeight,
+      label: " {bold}OPEN TRADES{/bold} ",
+      border: { type: "line" },
+      style: { border: { fg: "yellow" }, label: { fg: "yellow" } },
+      tags: true,
+      padding: { left: 1, right: 1 },
+    });
+
     // ─── Risk / stats bar ────────────────────────────────────────────
     this.statsBox = blessed.box({
       parent: this.screen,
-      top: 1 + marketsHeight, left: 0, right: 0, height: statsHeight,
+      top: 1 + marketsHeight + tradesHeight, left: 0, right: 0, height: statsHeight,
       label: " {bold}RISK & EXECUTION{/bold} ",
       border: { type: "line" },
       style: { border: { fg: "cyan" }, label: { fg: "cyan" } },
@@ -59,7 +72,7 @@ export class TUI {
     // ─── Log pane ────────────────────────────────────────────────────
     this.logBox = blessed.log({
       parent: this.screen,
-      top: 1 + marketsHeight + statsHeight,
+      top: 1 + marketsHeight + tradesHeight + statsHeight,
       left: 0, right: 0, bottom: 0,
       label: " {bold}LOG{/bold}  {dim}(scroll: ↑↓  |  q: quit){/dim} ",
       border: { type: "line" },
@@ -67,7 +80,7 @@ export class TUI {
       tags: false,
       scrollable: true,
       alwaysScroll: true,
-      scrollback: 500,  // cap line buffer — prevents unbounded memory growth
+      scrollback: 500,
       scrollbar: { ch: "▐", style: { fg: "cyan" } },
       mouse: true,
       keys: true,
@@ -87,44 +100,39 @@ export class TUI {
     const now = new Date().toISOString().slice(11, 19) + " UTC";
     const modeTag = mode === "DRY RUN" ? "{yellow-fg}DRY RUN{/yellow-fg}" : "{red-fg}{bold}LIVE{/bold}{/red-fg}";
 
-    // Header
+    // ─── Header ──────────────────────────────────────────────────────
     this.header.setContent(
       `{bold}⚡ LATENCY ARB{/bold}  ${modeTag}  Bankroll: {bold}$${risk.bankroll.toFixed(2)}{/bold}  Uptime: ${uptime}m  {dim}${now}{/dim}`
     );
 
-    // Markets table
-    const cols = { label: 9, spot: 12, strike: 11, mid: 10, edge: 8, lag: 9 };
+    // ─── Markets table ───────────────────────────────────────────────
+    const mCols = { label: 9, spot: 12, strike: 11, mid: 10, edge: 8, lag: 9 };
     const head =
       `{bold}{cyan-fg}` +
-      `${"MARKET".padEnd(cols.label)} ` +
-      `${"SPOT".padEnd(cols.spot)} ` +
-      `${"STRIKE".padEnd(cols.strike)} ` +
-      `${"MID".padEnd(cols.mid)} ` +
-      `${"EDGE".padEnd(cols.edge)} ` +
-      `${"LAG".padEnd(cols.lag)} ` +
-      `WINDOW{/cyan-fg}{/bold}`;
+      `${"MARKET".padEnd(mCols.label)} ` +
+      `${"SPOT".padEnd(mCols.spot)} ` +
+      `${"STRIKE".padEnd(mCols.strike)} ` +
+      `${"MID".padEnd(mCols.mid)} ` +
+      `${"EDGE".padEnd(mCols.edge)} ` +
+      `${"LAG".padEnd(mCols.lag)} ` +
+      `EXPIRY{/cyan-fg}{/bold}`;
 
     const rows = markets.map(({ bStats, sStats }) => {
-      // Pad raw values BEFORE adding color tags — blessed strips tags when
-      // rendering, but JS padEnd() counts tag chars and adds no padding if
-      // the tagged string is already "wide" from JS's perspective.
       const dot    = bStats.connected ? "{green-fg}●{/green-fg}" : "{red-fg}●{/red-fg}";
-      const label  = (sStats.label || "—").padEnd(cols.label - 2);
-      const spot   = (sStats.spotPrice   ? `$${sStats.spotPrice.toFixed(2)}`           : "—").padEnd(cols.spot);
-      const strike = (sStats.strikePrice ? `$${sStats.strikePrice.toFixed(2)}`         : "—").padEnd(cols.strike);
-      const mid    = (sStats.contractMid ? `${(sStats.contractMid * 100).toFixed(1)}¢` : "—").padEnd(cols.mid);
-      const lagStr = (sStats.feedLag != null ? `${sStats.feedLag}ms`                   : "—").padEnd(cols.lag);
+      const label  = (sStats.label || "—").padEnd(mCols.label - 2);
+      const spot   = (sStats.spotPrice   ? `$${sStats.spotPrice.toFixed(2)}`           : "—").padEnd(mCols.spot);
+      const strike = (sStats.strikePrice ? `$${sStats.strikePrice.toFixed(2)}`         : "—").padEnd(mCols.strike);
+      const mid    = (sStats.contractMid ? `${(sStats.contractMid * 100).toFixed(1)}¢` : "—").padEnd(mCols.mid);
+      const lagStr = (sStats.feedLag != null ? `${sStats.feedLag}ms`                   : "—").padEnd(mCols.lag);
 
-      // Edge: pad first, color after
       let edgeStr;
       if (sStats.edge) {
-        const padded = ((sStats.edge * 100).toFixed(1) + "%").padEnd(cols.edge);
+        const padded = ((sStats.edge * 100).toFixed(1) + "%").padEnd(mCols.edge);
         edgeStr = sStats.edge >= 0.03 ? `{green-fg}${padded}{/green-fg}` : padded;
       } else {
-        edgeStr = "—".padEnd(cols.edge);
+        edgeStr = "—".padEnd(mCols.edge);
       }
 
-      // Countdown to expiry of current window
       let expiry = "—";
       if (sStats.marketEndDate) {
         const sec = Math.round((new Date(sStats.marketEndDate).getTime() - Date.now()) / 1000);
@@ -141,7 +149,46 @@ export class TUI {
 
     this.marketsBox.setContent([head, ...rows].join("\n"));
 
-    // Stats / risk
+    // ─── Open trades table ───────────────────────────────────────────
+    const tCols = { label: 9, dir: 9, entry: 9, curr: 9, pnl: 10, age: 7 };
+    const tHead =
+      `{bold}{yellow-fg}` +
+      `${"MARKET".padEnd(tCols.label)} ` +
+      `${"DIR".padEnd(tCols.dir)} ` +
+      `${"ENTRY".padEnd(tCols.entry)} ` +
+      `${"CURR".padEnd(tCols.curr)} ` +
+      `${"P&L".padEnd(tCols.pnl)} ` +
+      `AGE{/yellow-fg}{/bold}`;
+
+    const openTrades = execution.openTrades || [];
+    let tradeRows;
+    if (openTrades.length === 0) {
+      tradeRows = ["{dim}no open positions{/dim}"];
+    } else {
+      tradeRows = openTrades.map(t => {
+        const label = (t.label || "—").padEnd(tCols.label);
+        const dir   = (t.isCertainty ? `${t.direction}*` : t.direction).padEnd(tCols.dir);
+        const entry = `${(t.entryPrice * 100).toFixed(1)}¢`.padEnd(tCols.entry);
+        const curr  = (t.currentMid != null ? `${(t.currentMid * 100).toFixed(1)}¢` : "—").padEnd(tCols.curr);
+        const ageSec = Math.round((Date.now() - t.openTime) / 1000);
+        const age   = `${Math.floor(ageSec / 60)}:${String(ageSec % 60).padStart(2, "0")}`;
+
+        let pnlStr;
+        if (t.unrealizedPnl != null) {
+          const raw   = `${t.unrealizedPnl >= 0 ? "+" : ""}$${t.unrealizedPnl.toFixed(2)}`;
+          const padded = raw.padEnd(tCols.pnl);
+          pnlStr = t.unrealizedPnl >= 0 ? `{green-fg}${padded}{/green-fg}` : `{red-fg}${padded}{/red-fg}`;
+        } else {
+          pnlStr = "—".padEnd(tCols.pnl);
+        }
+
+        return `${label} ${dir} ${entry} ${curr} ${pnlStr} ${age}`;
+      });
+    }
+
+    this.tradesBox.setContent([tHead, ...tradeRows].join("\n"));
+
+    // ─── Stats / risk ────────────────────────────────────────────────
     const dailyColor = risk.dailyPnl  >= 0 ? "{green-fg}" : "{red-fg}";
     const totalColor = execution.pnlStats.sum >= 0 ? "{green-fg}" : "{red-fg}";
     const polyDot    = poly.connected ? "{green-fg}●{/green-fg}" : "{red-fg}●{/red-fg}";

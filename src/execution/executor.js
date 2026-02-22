@@ -1,6 +1,7 @@
 import { createLogger } from "../utils/logger.js";
 import { sendAlert } from "../utils/alerts.js";
 import { RunningStats } from "../utils/math.js";
+import { logTrade } from "../utils/tradeLog.js";
 
 const log = createLogger("EXECUTOR");
 
@@ -15,6 +16,8 @@ const log = createLogger("EXECUTOR");
  *   - Track order status (open → filled → resolved)
  *   - Report P&L back to risk manager
  *   - Handle partial fills, timeouts, cancellations
+ *   - Log all trades to data/trades.ndjson
+ *   - Expose getOpenSnapshot() + restorePositions() for crash recovery
  */
 export class Executor {
   constructor(polyClient, riskManager) {
@@ -32,6 +35,9 @@ export class Executor {
     // Trade history (ring buffer)
     this.tradeHistory = [];
     this.maxHistory = 500;
+
+    // Called whenever a trade opens or closes — used by ArbEngine to persist state.
+    this.onTradeEvent = null;
   }
 
   // ─── EXECUTE SIGNAL ─────────────────────────────────────────────────
@@ -40,12 +46,11 @@ export class Executor {
     this.fillRateStats.attempted++;
 
     try {
-      // Build order parameters
       const orderParams = {
         tokenId: signal.tokenId,
-        side: "BUY", // We always buy the token we think is underpriced
+        side: "BUY",
         price: signal.entryPrice,
-        size: signal.size / signal.entryPrice, // convert USD to contract quantity
+        size: signal.size / signal.entryPrice,
         orderType: "GTC",
       };
 
@@ -55,13 +60,11 @@ export class Executor {
         spot: `$${signal.spotPrice.toFixed(1)}`,
       });
 
-      // Place order
       const order = await this.poly.placeOrder(orderParams);
       const latency = Date.now() - start;
       this.executionLatencies.push(latency);
       if (this.executionLatencies.length > 100) this.executionLatencies.shift();
 
-      // Track the order
       const trade = {
         id: order.id,
         signal,
@@ -73,6 +76,8 @@ export class Executor {
         openTime: Date.now(),
         executionLatency: latency,
         pnl: null,
+        currentMid: null,    // updated by monitor every 2s — used by TUI
+        unrealizedPnl: null, // ditto
       };
 
       this.openOrders.set(order.id, trade);
@@ -84,11 +89,25 @@ export class Executor {
       });
 
       this.fillRateStats.filled++;
-
       log.trade(`Order live: ${order.id}`, { latency: `${latency}ms` });
 
-      // Start monitoring this position for exit
+      logTrade({
+        event: "open",
+        id: trade.id,
+        label: signal.label,
+        direction: signal.direction,
+        entryPrice: signal.entryPrice,
+        size: signal.size,
+        edge: signal.edge,
+        modelProb: signal.modelProb,
+        spotPrice: signal.spotPrice,
+        strikePrice: signal.strikePrice,
+        openTime: trade.openTime,
+        isCertainty: signal.isCertainty || false,
+      });
+
       this._monitorPosition(trade);
+      this.onTradeEvent?.({ type: "open", trade });
 
       return trade;
 
@@ -96,34 +115,20 @@ export class Executor {
       this.fillRateStats.failed++;
       log.error("Execution failed", {
         error: err.message,
-        signal: {
-          direction: signal.direction,
-          size: signal.size.toFixed(2),
-          edge: `${(signal.edge * 100).toFixed(1)}%`,
-        },
+        signal: { direction: signal.direction, size: signal.size.toFixed(2), edge: `${(signal.edge * 100).toFixed(1)}%` },
       });
       return null;
     }
   }
 
   // ─── POSITION MONITORING ────────────────────────────────────────────
-  /**
-   * Monitor a position for exit conditions.
-   *
-   * Exit when:
-   *   1. Edge collapses (contract catches up to model) → take profit
-   *   2. Position times out (5 min max hold) → market exit
-   *   3. Edge inverts beyond loss threshold → stop loss
-   */
   _monitorPosition(trade) {
-    const checkInterval = 2000; // check every 2s
-    // Certainty-arb trades must exit before the contract expires.
-    // Normal trades get the full 5-minute max hold.
+    const checkInterval = 2000;
     const maxHoldMs = trade.signal.isCertainty
       ? Math.max((trade.signal.expiresAt || 0) - trade.openTime, 5000)
       : 300000;
-    const profitTarget = 0.03;  // exit at 3% of contract move toward model
-    const stopLoss = -0.5;      // stop at 50% loss on position
+    const profitTarget = 0.03;
+    const stopLoss = -0.5;
 
     const monitor = setInterval(async () => {
       // Stop if this trade was cancelled externally (e.g. market rotation).
@@ -134,64 +139,32 @@ export class Executor {
 
       const age = Date.now() - trade.openTime;
 
-      // Fetch this position's specific token book directly (not shared state).
       let currentMid;
       try {
         const currentBook = await this.poly.fetchOrderbook(trade.signal.tokenId);
         if (!currentBook || currentBook.bestBid === 0 && currentBook.bestAsk === 1) return;
         currentMid = currentBook.mid;
       } catch {
-        return; // skip this check, retry next interval
+        return;
       }
-      const entryPrice = trade.entryPrice;
 
-      // Calculate unrealized P&L
-      // entryPrice is the token's ask at entry (YES ask for BUY_YES, NO ask for BUY_NO).
-      // currentMid is the same token's current mid (fetched via fetchOrderbook above).
-      // Contracts held = trade.size / entryPrice; profit = price movement × contracts.
-      const unrealizedPnl = (currentMid - entryPrice) * (trade.size / entryPrice);
-
+      const unrealizedPnl = (currentMid - trade.entryPrice) * (trade.size / trade.entryPrice);
       const pnlPct = unrealizedPnl / trade.size;
 
-      // ─── EXIT CONDITIONS ────────────────────────────────────────────
+      // Update trade in-place so TUI can read current state
+      trade.currentMid = currentMid;
+      trade.unrealizedPnl = unrealizedPnl;
+
       let shouldExit = false;
       let exitReason = "";
 
-      // Time-based exit
-      if (age >= maxHoldMs) {
-        shouldExit = true;
-        exitReason = "MAX_HOLD_TIME";
-      }
+      if (age >= maxHoldMs)                                                  { shouldExit = true; exitReason = "MAX_HOLD_TIME"; }
+      if (pnlPct >= profitTarget)                                            { shouldExit = true; exitReason = "PROFIT_TARGET"; }
+      if (pnlPct <= stopLoss)                                                { shouldExit = true; exitReason = "STOP_LOSS"; }
+      if (trade.signal.isCertainty && Date.now() >= trade.signal.expiresAt) { shouldExit = true; exitReason = "CERTAINTY_EXPIRY"; }
 
-      // Profit target
-      if (pnlPct >= profitTarget) {
-        shouldExit = true;
-        exitReason = "PROFIT_TARGET";
-      }
-
-      // Stop loss
-      if (pnlPct <= stopLoss) {
-        shouldExit = true;
-        exitReason = "STOP_LOSS";
-      }
-
-      // Certainty-arb: force exit before contract expires
-      if (trade.signal.isCertainty && trade.signal.expiresAt && Date.now() >= trade.signal.expiresAt) {
-        shouldExit = true;
-        exitReason = "CERTAINTY_EXPIRY";
-      }
-
-      // Contract caught up to model (edge collapsed) — main exit
-      // This is the primary arb resolution: Polymarket price adjusts.
-      // For BUY_YES: currentMid is YES price; compare directly to modelProb.
-      // For BUY_NO:  currentMid is NO price; edge collapses when NO ≈ 1 - modelProb.
-      const targetPrice = trade.direction === "BUY_YES"
-        ? trade.signal.modelProb
-        : 1 - trade.signal.modelProb;
-      if (Math.abs(currentMid - targetPrice) < 0.02) {
-        shouldExit = true;
-        exitReason = "EDGE_COLLAPSED";
-      }
+      const targetPrice = trade.direction === "BUY_YES" ? trade.signal.modelProb : 1 - trade.signal.modelProb;
+      if (Math.abs(currentMid - targetPrice) < 0.02) { shouldExit = true; exitReason = "EDGE_COLLAPSED"; }
 
       if (shouldExit) {
         clearInterval(monitor);
@@ -203,11 +176,11 @@ export class Executor {
     setTimeout(async () => {
       clearInterval(monitor);
       if (this.openOrders.has(trade.id)) {
-        let currentMid = trade.entryPrice; // fallback
+        let currentMid = trade.currentMid ?? trade.entryPrice;
         try {
           const currentBook = await this.poly.fetchOrderbook(trade.signal.tokenId);
           if (currentBook) currentMid = currentBook.mid;
-        } catch { /* use fallback */ }
+        } catch { /* use last known */ }
         const pnl = (currentMid - trade.entryPrice) * (trade.size / trade.entryPrice);
         this._exitPosition(trade, pnl, "FORCE_EXIT", currentMid);
       }
@@ -215,9 +188,6 @@ export class Executor {
   }
 
   async _exitPosition(trade, pnl, reason, exitPrice) {
-    // In a real system, we'd sell the position on Polymarket here.
-    // For now, we close tracking and report P&L.
-
     trade.status = "CLOSED";
     trade.pnl = pnl;
     trade.exitPrice = exitPrice;
@@ -229,11 +199,8 @@ export class Executor {
     this.risk.closePosition(trade.id, pnl);
     this.pnlStats.push(pnl);
 
-    // Archive
     this.tradeHistory.push(trade);
-    if (this.tradeHistory.length > this.maxHistory) {
-      this.tradeHistory.shift();
-    }
+    if (this.tradeHistory.length > this.maxHistory) this.tradeHistory.shift();
 
     log.trade(`EXIT [${reason}] ${trade.direction}`, {
       pnl: `$${pnl.toFixed(2)}`,
@@ -242,7 +209,24 @@ export class Executor {
       hold: `${(trade.holdTime / 1000).toFixed(1)}s`,
     });
 
-    // Try to sell position on Polymarket
+    logTrade({
+      event: "close",
+      id: trade.id,
+      label: trade.signal.label,
+      direction: trade.direction,
+      entryPrice: trade.entryPrice,
+      exitPrice,
+      size: trade.size,
+      pnl,
+      pnlPct: pnl / trade.size,
+      reason,
+      holdMs: trade.holdTime,
+      openTime: trade.openTime,
+      exitTime: trade.exitTime,
+    });
+
+    this.onTradeEvent?.({ type: "close", trade });
+
     try {
       if (trade.order.status !== "SIMULATED") {
         await this.poly.placeOrder({
@@ -254,10 +238,7 @@ export class Executor {
         });
       }
     } catch (err) {
-      log.error("Exit order failed — position may be orphaned", {
-        tradeId: trade.id,
-        error: err.message,
-      });
+      log.error("Exit order failed — position may be orphaned", { tradeId: trade.id, error: err.message });
       sendAlert(`⚠️ Exit order failed for ${trade.id}: ${err.message}`, "error");
     }
   }
@@ -285,11 +266,72 @@ export class Executor {
       } catch (err) {
         log.error(`Failed to cancel order ${trade.id}`, { error: err.message });
       }
-      // Clean up both executor and risk manager state.
-      // Must happen regardless of cancel success — the market is rotating and
-      // these positions can no longer be monitored or exited.
       this.openOrders.delete(trade.id);
-      this.risk.closePosition(trade.id, 0); // 0 P&L for cancelled unfilled order
+      this.risk.closePosition(trade.id, 0);
+    }
+    this.onTradeEvent?.({ type: "rotation_cancel", label });
+  }
+
+  // ─── CRASH RECOVERY ─────────────────────────────────────────────────
+  /**
+   * Serialize all open positions for persistence.
+   * Stored in data/state.json and restored on next startup.
+   */
+  getOpenSnapshot() {
+    return [...this.openOrders.values()].map(t => ({
+      id: t.id,
+      direction: t.direction,
+      entryPrice: t.entryPrice,
+      size: t.size,
+      openTime: t.openTime,
+      signal: t.signal,
+      order: { id: t.order.id, status: t.order.status },
+    }));
+  }
+
+  /**
+   * Restore open positions from a saved snapshot and restart their monitors.
+   * Risk manager state must be restored separately (via risk.restoreState)
+   * BEFORE calling this — we do NOT call risk.openPosition here to avoid
+   * double-counting positions that are already in the restored risk state.
+   */
+  restorePositions(snapshots) {
+    const now = Date.now();
+    const maxHold = 300000; // 5min
+
+    for (const snap of snapshots) {
+      const age = now - snap.openTime;
+
+      // Position too old to be worth monitoring — clean up risk state and skip.
+      if (age > maxHold + 60000) {
+        log.warn(`Skipping stale position ${snap.id} (age: ${Math.round(age / 1000)}s)`);
+        this.risk.closePosition(snap.id, 0);
+        logTrade({ event: "expired_on_restore", id: snap.id, label: snap.signal?.label, age });
+        continue;
+      }
+
+      const trade = {
+        id: snap.id,
+        signal: snap.signal,
+        order: snap.order || { id: snap.id, status: "RESTORED" },
+        entryPrice: snap.entryPrice,
+        size: snap.size,
+        direction: snap.direction,
+        status: "OPEN",
+        openTime: snap.openTime,
+        executionLatency: 0,
+        pnl: null,
+        currentMid: null,
+        unrealizedPnl: null,
+      };
+
+      this.openOrders.set(trade.id, trade);
+      log.info(`Restored position ${trade.id}`, {
+        label: trade.signal?.label,
+        direction: trade.direction,
+        age: `${Math.round(age / 1000)}s`,
+      });
+      this._monitorPosition(trade);
     }
   }
 
@@ -306,6 +348,17 @@ export class Executor {
 
     return {
       openOrders: this.openOrders.size,
+      openTrades: [...this.openOrders.values()].map(t => ({
+        id: t.id,
+        label: t.signal.label,
+        direction: t.direction,
+        entryPrice: t.entryPrice,
+        currentMid: t.currentMid,
+        unrealizedPnl: t.unrealizedPnl,
+        size: t.size,
+        openTime: t.openTime,
+        isCertainty: t.signal.isCertainty || false,
+      })),
       fillRate: this.fillRateStats,
       avgExecutionLatency: Math.round(avgLatency),
       pnlStats: this.pnlStats.toJSON(),

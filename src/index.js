@@ -8,6 +8,7 @@ import { MarketDiscovery } from "./discovery.js";
 import { createLogger, setLogSink } from "./utils/logger.js";
 import { sendAlert } from "./utils/alerts.js";
 import { TUI } from "./utils/tui.js";
+import { saveState, loadState } from "./utils/stateStore.js";
 
 const log = createLogger("MAIN");
 
@@ -57,6 +58,7 @@ class ArbEngine {
 
     this.startTime = Date.now();
     this.statusInterval = null;
+    this.saveInterval = null;
     this.tui = null;
   }
 
@@ -66,6 +68,20 @@ class ArbEngine {
     // Launch TUI — routes all log output to the log pane
     this.tui = new TUI(this.markets.length);
     setLogSink(line => this.tui.log(line));
+
+    // ─── Crash recovery — restore prior session state ────────────────
+    const savedState = loadState();
+    if (savedState) {
+      log.info("Restoring state from previous session...", { savedAt: savedState.savedAt });
+      this.risk.restoreState(savedState.risk || {});
+      if (savedState.openPositions?.length > 0) {
+        this.executor.restorePositions(savedState.openPositions);
+      }
+    }
+
+    // Persist state on every trade event + every 30s as a heartbeat
+    this.executor.onTradeEvent = () => this._saveState();
+    this.saveInterval = setInterval(() => this._saveState(), 30_000);
 
     log.info("Initializing engine...", {
       dryRun: CONFIG.execution.dryRun,
@@ -222,6 +238,8 @@ class ArbEngine {
     this.polymarket.disconnect();
 
     if (this.statusInterval) clearInterval(this.statusInterval);
+    if (this.saveInterval) clearInterval(this.saveInterval);
+    this._saveState(); // final save before exit
 
     // Restore terminal before printing final summary
     if (this.tui) this.tui.destroy();
@@ -237,6 +255,20 @@ class ArbEngine {
     );
 
     process.exit(0);
+  }
+
+  _saveState() {
+    saveState({
+      risk: {
+        bankroll: this.risk.bankroll,
+        peakBankroll: this.risk.peakBankroll,
+        dailyPnl: this.risk.dailyPnl,
+        dailyTrades: this.risk.dailyTrades,
+        dailyResetTime: this.risk.dailyResetTime,
+        openPositions: Array.from(this.risk.openPositions.values()),
+      },
+      openPositions: this.executor.getOpenSnapshot(),
+    });
   }
 
   _renderDashboard() {
