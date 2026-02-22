@@ -63,7 +63,9 @@ export function calculatePositionSize(bankroll, edge, contractPrice, config) {
   // Odds: if you buy YES at 0.53, you get $1 if win → odds = (1/0.53) - 1 = 0.887
   const odds = (1 / entryPrice) - 1;
 
-  const kelly = kellyFraction(edge.modelProb, odds, maxBetFraction);
+  // For BUY_NO you're betting NO wins, so win probability = 1 - P(YES)
+  const winProb = direction === "BUY_YES" ? edge.modelProb : 1 - edge.modelProb;
+  const kelly = kellyFraction(winProb, odds, maxBetFraction);
   if (kelly <= 0) return null;
 
   const rawSize = bankroll * kelly;

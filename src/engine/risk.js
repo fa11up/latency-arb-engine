@@ -93,9 +93,12 @@ export class RiskManager {
       reasons.push(`Edge ${(signal.edge * 100).toFixed(1)}% < cost ${(minViableEdge * 100).toFixed(1)}%`);
     }
 
-    // Minimum liquidity check
+    // Minimum liquidity check.
+    // Certainty-arb trades are halved in size and the book is thin by design —
+    // require 1x coverage. Normal trades require 2x to absorb slippage.
     if (signal && signal.availableLiquidity !== undefined) {
-      if (signal.availableLiquidity < signal.size * 2) {
+      const minLiq = signal.isCertainty ? signal.size : signal.size * 2;
+      if (signal.availableLiquidity < minLiq) {
         reasons.push(`Insufficient liquidity: $${signal.availableLiquidity.toFixed(2)} for $${signal.size.toFixed(2)} trade`);
       }
     }
@@ -157,6 +160,32 @@ export class RiskManager {
     if (Math.abs(pnl) > this.bankroll * 0.05) {
       sendAlert(`${pnl > 0 ? "✅" : "❌"} P&L: $${pnl.toFixed(2)} | Bankroll: $${this.bankroll.toFixed(2)}`, pnl > 0 ? "trade" : "warn");
     }
+  }
+
+  /**
+   * Book a partial exit: return realizedNotional to bankroll, credit realizedPnl,
+   * and reduce the open position size so future close/partial calls are correctly sized.
+   *
+   * Called by Executor when a sell order is partially filled.
+   * Keeps all risk accounting in one place — never mutate openPositions from outside.
+   */
+  applyPartialClose(tradeId, { realizedNotional, realizedPnl }) {
+    const pos = this.openPositions.get(tradeId);
+    if (!pos) {
+      log.warn(`applyPartialClose: unknown position ${tradeId}`);
+      return;
+    }
+    pos.size = Math.max(0, pos.size - realizedNotional);
+    this.bankroll += realizedNotional + realizedPnl;
+    this.dailyPnl += realizedPnl;
+    this.peakBankroll = Math.max(this.peakBankroll, this.bankroll);
+
+    log.trade(`Partial close: ${tradeId}`, {
+      realizedNotional: realizedNotional.toFixed(2),
+      realizedPnl: realizedPnl.toFixed(2),
+      newPosSize: pos.size.toFixed(2),
+      bankroll: this.bankroll.toFixed(2),
+    });
   }
 
   // ─── CRASH RECOVERY ────────────────────────────────────────────────

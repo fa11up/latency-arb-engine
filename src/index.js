@@ -12,6 +12,9 @@ import { saveState, loadState } from "./utils/stateStore.js";
 
 const log = createLogger("MAIN");
 
+const POLL_START_DELAY_MS = 5_000;  // wait for WS to settle before starting REST polling
+const SAVE_INTERVAL_MS    = 30_000; // heartbeat state persistence interval
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  LATENCY ARB ENGINE — BINANCE × POLYMARKET
 // ═══════════════════════════════════════════════════════════════════════════
@@ -66,8 +69,11 @@ class ArbEngine {
     validateConfig();
 
     // Launch TUI — routes all log output to the log pane
-    this.tui = new TUI(this.markets.length);
-    setLogSink(line => this.tui.log(line));
+    // Set NO_TUI=1 to skip the TUI and emit plain logs to stdout (useful for observation/debugging)
+    if (process.env.NO_TUI !== "1") {
+      this.tui = new TUI(this.markets.length);
+      setLogSink(line => this.tui.log(line));
+    }
 
     // ─── Crash recovery — restore prior session state ────────────────
     const savedState = loadState();
@@ -81,7 +87,7 @@ class ArbEngine {
 
     // Persist state on every trade event + every 30s as a heartbeat
     this.executor.onTradeEvent = () => this._saveState();
-    this.saveInterval = setInterval(() => this._saveState(), 30_000);
+    this.saveInterval = setInterval(() => this._saveState(), SAVE_INTERVAL_MS);
 
     log.info("Initializing engine...", {
       dryRun: CONFIG.execution.dryRun,
@@ -93,6 +99,9 @@ class ArbEngine {
 
     // ─── Wire Binance feeds to their strategies ─────────────────────
     for (const market of this.markets) {
+      // Inject live bankroll getter so strategy sizes positions against current capital.
+      market.strategy.setBankrollGetter(() => this.risk.bankroll);
+
       market.binance.on("price", (data) => {
         market.strategy.onSpotUpdate(data);
       });
@@ -117,6 +126,13 @@ class ArbEngine {
     // ─── Wire strategy signals to execution ─────────────────────────
     for (const market of this.markets) {
       market.strategy.onSignal(async (signal) => {
+        // Prevent stacking multiple positions in the same market.
+        // If this market already has an open position, skip — don't double-down
+        // on a potentially wrong directional bet.
+        const hasOpenForMarket = [...this.executor.openOrders.values()]
+          .some(t => t.signal.label === signal.label);
+        if (hasOpenForMarket) return;
+
         const check = this.risk.canTrade(signal);
         if (!check.allowed) {
           log.debug(`[${signal.label}] Signal rejected`, { reasons: check.reasons });
@@ -145,7 +161,7 @@ class ArbEngine {
           this.polymarket.startPolling(m.activeMarket.tokenIdYes, 1000);
         }
       }
-    }, 5000);
+    }, POLL_START_DELAY_MS);
 
     // ─── Status dashboard — redraws TUI every second ─────────────────
     this.statusInterval = setInterval(() => this._renderDashboard(), 1000);
@@ -157,8 +173,24 @@ class ArbEngine {
       log.error("Uncaught exception", { error: err.message, stack: err.stack });
       this.shutdown("UNCAUGHT_EXCEPTION");
     });
+    // Kill-switch: halt trading after 5+ unhandled rejections in a 60s window.
+    // A burst of unhandled rejections usually indicates a corrupted async chain
+    // (e.g. a feed error cascading through multiple strategies simultaneously).
+    const _rejectionTimes = [];
     process.on("unhandledRejection", (err) => {
-      log.error("Unhandled rejection", { error: err?.message || err });
+      const now = Date.now();
+      _rejectionTimes.push(now);
+      // Evict events older than 60 seconds
+      while (_rejectionTimes.length > 0 && now - _rejectionTimes[0] > 60000) {
+        _rejectionTimes.shift();
+      }
+      log.error(`Unhandled rejection (${_rejectionTimes.length} in 60s)`, {
+        error: err?.message || String(err),
+      });
+      if (_rejectionTimes.length >= 5 && !this.risk.killed) {
+        log.error("Kill-switch: 5+ unhandled rejections in 60s — halting trading");
+        this.risk.kill("5+ unhandled rejections in 60s");
+      }
     });
 
     log.info("Engine running. Waiting for signals...\n");

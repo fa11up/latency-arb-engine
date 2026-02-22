@@ -4,6 +4,10 @@ import { impliedProbability, calculateEdge, calculatePositionSize, RunningStats,
 
 const log = createLogger("STRATEGY");
 
+// ─── SIGNAL CONSTANTS ──────────────────────────────────────────────────────────
+const CERTAINTY_WINDOW_SECS = 90;    // switch to certainty-arb mode in last N seconds
+const MIN_EXPIRY_BUFFER_MS  = 5_000; // don't enter a trade if < 5s to expiry
+
 /**
  * Strategy engine.
  *
@@ -71,6 +75,10 @@ export class Strategy {
 
     // Signal listeners
     this._onSignal = null;
+
+    // Live bankroll getter — injected by ArbEngine so sizing uses current bankroll,
+    // not the static CONFIG value captured at startup.
+    this._getBankroll = null;
   }
 
   /**
@@ -100,6 +108,15 @@ export class Strategy {
 
   onSignal(handler) {
     this._onSignal = handler;
+  }
+
+  /** Inject a live bankroll getter so position sizing uses current capital. */
+  setBankrollGetter(fn) {
+    this._getBankroll = fn;
+  }
+
+  _liveBankroll() {
+    return this._getBankroll ? this._getBankroll() : CONFIG.risk.bankroll;
   }
 
   // ─── FEED HANDLERS ──────────────────────────────────────────────────
@@ -172,7 +189,7 @@ export class Strategy {
     if (hoursToExpiry <= 0) return; // expired
 
     const secsToExpiry = hoursToExpiry * 3600;
-    if (secsToExpiry <= 90) {
+    if (secsToExpiry <= CERTAINTY_WINDOW_SECS) {
       // Certainty-arb window (0–90s): book thins, but large moves create genuine edge
       this._evaluateCertainty(hoursToExpiry, vol);
       return;
@@ -216,13 +233,13 @@ export class Strategy {
     if (feedLag < 1000) return; // still need to see staleness
 
     const msRemaining = new Date(this.marketEndDate).getTime() - Date.now();
-    if (msRemaining < 5000) return; // too close to expiry for safe execution
+    if (msRemaining < MIN_EXPIRY_BUFFER_MS) return; // too close to expiry for safe execution
 
     const smallRisk = { ...CONFIG.risk, maxBetFraction: certaintyMaxFraction };
-    const sizing = calculatePositionSize(CONFIG.risk.bankroll, edge, this.contractMid, smallRisk);
+    const sizing = calculatePositionSize(this._liveBankroll(), edge, this.contractMid, smallRisk);
     if (!sizing) return;
 
-    const expiresAt = Date.now() + Math.max(msRemaining - 5000, 1000);
+    const expiresAt = Date.now() + Math.max(msRemaining - MIN_EXPIRY_BUFFER_MS, 1000);
 
     this._fireSignal({
       edge,
@@ -241,7 +258,7 @@ export class Strategy {
     if (!this._onSignal) return;
 
     const sizing = sizingOverride || calculatePositionSize(
-      CONFIG.risk.bankroll,
+      this._liveBankroll(),
       edge,
       this.contractMid,
       CONFIG.risk
@@ -293,7 +310,7 @@ export class Strategy {
       spot: `$${this.spotPrice.toFixed(2)}`,
       lag: `${feedLag}ms`,
       size: `$${signal.size.toFixed(2)}`,
-      ...(isCertainty && { secsLeft: Math.round(hoursToExpiry * 3600) }),
+      ...(isCertainty && { secsLeft: Math.round(hoursToExpiry * 3600), window: CERTAINTY_WINDOW_SECS }),
     });
 
     this._onSignal(signal);

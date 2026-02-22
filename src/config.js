@@ -12,7 +12,7 @@ function env(key, fallback) {
 function envNum(key, fallback) {
   const raw = env(key, fallback?.toString());
   const n = Number(raw);
-  if (Number.isNaN(n)) throw new Error(`Invalid number for ${key}: ${raw}`);
+  if (!Number.isFinite(n)) throw new Error(`Invalid number for ${key}: ${raw}`);
   return n;
 }
 
@@ -76,14 +76,16 @@ export const CONFIG = Object.freeze({
   // ─── Risk ─────────────────────────────────────────────────────────
   risk: {
     bankroll: envNum("BANKROLL", 1300),
-    maxBetFraction: envNum("MAX_BET_FRACTION", 0.04),
+    maxBetFraction: envNum("MAX_BET_FRACTION", 0.1),
     maxPositionUsd: envNum("MAX_POSITION_USD", 100),
-    maxOpenPositions: envNum("MAX_OPEN_POSITIONS", 5),
+    maxOpenPositions: envNum("MAX_OPEN_POSITIONS", 8),
     cooldownMs: envNum("COOLDOWN_MS", 3000),
     slippageBps: envNum("SLIPPAGE_BPS", 15),
     feeBps: envNum("FEE_BPS", 20),
     maxDrawdownPct: 0.25,  // kill switch at 25% drawdown
-    dailyLossLimit: 200,
+    dailyLossLimit: envNum("DAILY_LOSS_LIMIT", 50),
+    profitTargetPct: envNum("PROFIT_TARGET_PCT", 0.03),
+    stopLossPct: envNum("STOP_LOSS_PCT", 0.15),
   },
 
   // ─── Execution ────────────────────────────────────────────────────
@@ -116,6 +118,14 @@ export function validateConfig() {
 
   if (CONFIG.strategy.entryThreshold < 0.03) {
     errors.push("ENTRY_THRESHOLD < 3% leaves no room for slippage + fees");
+  }
+
+  if (CONFIG.risk.profitTargetPct <= 0 || CONFIG.risk.profitTargetPct >= 1) {
+    errors.push("PROFIT_TARGET_PCT must be between 0 and 1");
+  }
+
+  if (CONFIG.risk.stopLossPct <= 0 || CONFIG.risk.stopLossPct >= 1) {
+    errors.push("STOP_LOSS_PCT must be between 0 and 1");
   }
 
   if (errors.length > 0) {

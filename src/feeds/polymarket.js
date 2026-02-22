@@ -75,7 +75,7 @@ export class PolymarketFeed {
   }
 
   // ─── REST API ───────────────────────────────────────────────────────
-  async _request(method, path, body = null) {
+  async _request(method, path, body = null, attempt = 0) {
     const url = `${CONFIG.poly.restUrl}${path}`;
     const bodyStr = body ? JSON.stringify(body) : "";
     const start = Date.now();
@@ -90,6 +90,14 @@ export class PolymarketFeed {
       const latency = Date.now() - start;
       this._restLatencies.push(latency);
       if (this._restLatencies.length > 100) this._restLatencies.shift();
+
+      // Exponential backoff on 429 (rate-limited), up to 3 retries with jitter.
+      if (resp.status === 429 && attempt < 3) {
+        const backoff = Math.round(1000 * Math.pow(2, attempt) + Math.random() * 500);
+        log.warn(`REST ${method} ${path} rate-limited — retry ${attempt + 1} in ${backoff}ms`);
+        await new Promise(r => setTimeout(r, backoff));
+        return this._request(method, path, body, attempt + 1);
+      }
 
       if (!resp.ok) {
         const errBody = await resp.text();
@@ -331,6 +339,7 @@ export class PolymarketFeed {
         id: result.orderID || result.id,
         ...body,
         status: result.status || "OPEN",
+        avgPrice: result.avgPrice ?? result.fillPrice ?? null,
         timestamp: Date.now(),
         raw: result,
       };
@@ -356,6 +365,13 @@ export class PolymarketFeed {
     }
 
     return this._request("DELETE", "/orders");
+  }
+
+  async getOrder(orderId) {
+    if (CONFIG.execution.dryRun) {
+      return { id: orderId, status: "MATCHED", avgPrice: null };
+    }
+    return this._request("GET", `/order/${orderId}`);
   }
 
   async getOpenOrders() {

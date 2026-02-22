@@ -39,8 +39,8 @@ Exploits the 3-7 second lag between Binance spot price updates and Polymarket CL
    - *Latency-arb* (t > 90s): edge > 3% AND contract stale >1s behind spot
    - *Certainty-arb* (0 < t ≤ 90s): edge > 15% as outcome approaches certainty; half-size; force-exits before expiry
 6. **Risk check**: position limits, drawdown, cooldown, liquidity
-7. **Execution**: place order on Polymarket CLOB
-8. **Monitoring**: track position, exit on edge collapse / timeout / stop loss
+7. **Execution**: place order on Polymarket CLOB; poll for fill confirmation
+8. **Monitoring**: track position, exit on edge collapse / timeout / stop loss / expiry
 
 ## Setup
 
@@ -51,6 +51,9 @@ npm install
 # Copy and configure environment
 cp .env.example .env
 # Edit .env with your Polymarket API credentials
+
+# Run tests
+npm test
 
 # Run in dry-run mode (paper trading)
 npm run dry-run
@@ -73,20 +76,26 @@ All configuration is in `.env`. Key parameters:
 | `CERTAINTY_MAX_FRACTION` | 0.02 | Kelly cap for certainty-arb positions (2% of bankroll) |
 | `MAX_BET_FRACTION` | 0.04 | Kelly fraction cap (4% of bankroll) |
 | `MAX_POSITION_USD` | 100 | Max USD per single trade |
-| `MAX_OPEN_POSITIONS` | 5 | Concurrent position limit |
-| `COOLDOWN_MS` | 3000 | Minimum ms between trades |
+| `MAX_OPEN_POSITIONS` | 8 | Concurrent position limit |
+| `DAILY_LOSS_LIMIT` | 50 | Stop trading after this many USD lost in a day |
+| `PROFIT_TARGET_PCT` | 0.03 | Exit a position when it reaches 3% profit |
+| `STOP_LOSS_PCT` | 0.50 | Exit a position at 50% loss |
+| `COOLDOWN_MS` | 3000 | Minimum ms between trades (stamped atomically) |
 | `SLIPPAGE_BPS` | 15 | Expected slippage in basis points |
 | `FEE_BPS` | 20 | Polymarket fee in basis points |
 | `ORDER_TYPE` | GTC | Order type (GTC = Good Till Cancelled) |
+| `DRY_RUN` | true | Paper trading mode — no real orders placed |
 
 ## Risk Controls
 
-- **Kelly Criterion**: Half-Kelly sizing with configurable cap
-- **Max Drawdown Kill Switch**: Auto-stops at 25% drawdown from peak
-- **Daily Loss Limit**: Stops trading after $200 daily loss
-- **Position Limits**: Max concurrent positions and per-trade USD cap
-- **Cooldown**: Minimum ms between trades (stamped atomically to prevent race conditions)
-- **Liquidity Check**: Rejects signals with insufficient book depth
+- **Kelly Criterion**: Half-Kelly sizing with configurable cap; uses live bankroll (not static startup value)
+- **Max Drawdown Kill Switch**: Auto-stops at 25% drawdown from peak; sticky — does not reset
+- **Daily Loss Limit**: Stops trading after `DAILY_LOSS_LIMIT` USD lost (resets at UTC midnight)
+- **Position Limits**: Max concurrent positions and per-trade USD cap; per-market stacking prevented
+- **Cooldown**: Minimum ms between trades, stamped atomically in `canTrade()` to prevent races
+- **Liquidity Check**: Rejects signals if available book depth is below position size; relaxed threshold for certainty-arb
+- **Unhandled Rejection Kill Switch**: 5+ unhandled promise rejections in a 60s sliding window halts trading
+- **Shutdown Accounting**: On shutdown, open positions are marked to current book mid (`estimated: true`) — no forced break-even
 
 ## Multi-Market Support
 
@@ -107,18 +116,31 @@ src/
 ├── discovery.js             # Auto-discovers Up/Down contracts (Gamma API)
 ├── feeds/
 │   ├── binance.js           # Binance depth WebSocket (depth20@100ms)
-│   └── polymarket.js        # Polymarket CLOB WS + REST polling
+│   └── polymarket.js        # Polymarket CLOB WS + REST polling (429 retry)
 ├── engine/
 │   ├── strategy.js          # Signal generation (latency-arb + certainty-arb)
-│   └── risk.js              # Risk management (limits, kill switch)
+│   └── risk.js              # Risk management (limits, kill switch, partial-close accounting)
 ├── execution/
-│   └── executor.js          # Order placement + position tracking
+│   └── executor.js          # Order placement, fill confirmation, position monitoring
 └── utils/
     ├── logger.js            # Structured logging with TUI sink
     ├── math.js              # Probability, Kelly, statistics
     ├── alerts.js            # Discord/Telegram alerts
-    └── tui.js               # blessed terminal dashboard
+    ├── tui.js               # blessed terminal dashboard
+    ├── tradeLog.js          # Append-only NDJSON trade audit log (data/trades.ndjson)
+    └── stateStore.js        # JSON crash-recovery state (data/state.json)
+
+tests/
+└── executor.test.js         # 24 tests (node:test built-in)
 ```
+
+## Tests
+
+```bash
+npm test
+```
+
+Uses Node.js built-in `node:test`. No external test framework required. Coverage includes: partial fill handling, fill timeout, partial-exit risk accounting, cumulative P&L, shutdown mark-to-market, monitor race conditions, idempotent finalization, `canTrade` kill conditions, liquidity rules, cooldown reservation, and per-market order isolation.
 
 ## Realistic Expectations
 
