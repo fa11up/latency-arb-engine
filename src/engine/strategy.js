@@ -1,22 +1,17 @@
 import { CONFIG } from "../config.js";
 import { createLogger } from "../utils/logger.js";
+import { logFeature } from "../utils/featureLog.js";
 import { impliedProbability, calculateEdge, calculatePositionSize, RunningStats, EMA } from "../utils/math.js";
 
 const log = createLogger("STRATEGY");
 
 // ─── SIGNAL CONSTANTS ──────────────────────────────────────────────────────────
-const CERTAINTY_WINDOW_SECS      = 90;    // switch to certainty-arb mode in last N seconds
-const MIN_EXPIRY_BUFFER_MS       = 5_000; // don't enter a trade if < 5s to expiry
-const MODEL_SATURATION_THRESHOLD = 0.90;  // suppress latency-arb signals when N(d2) > 90%
+const MODEL_SATURATION_THRESHOLD = 0.90;  // suppress signals when N(d2) > 90%
                                            // (tiny-T singularity: oracle uses ~1-min TWAP,
                                            //  not spot tick — apparent edge is not real)
 const STALE_CONTRACT_MAX_MS      = 5_000; // suppress signals when contract data is > 5s stale
                                            // (REST poll failures freeze lastContractUpdate while
                                            //  Binance ticks keep arriving, inflating feedLag)
-const CERTAINTY_MIN_PRICE        = 0.15;  // min price for the token side we'd buy in certainty arb
-                                           // below this the market has already committed to the outcome —
-                                           // BS vol (calibrated to 30-day realized) doesn't capture
-                                           // near-expiry resolution certainty, so apparent edge is phantom
 
 /**
  * Strategy engine.
@@ -25,11 +20,6 @@ const CERTAINTY_MIN_PRICE        = 0.15;  // min price for the token side we'd b
  * Computes the theoretical probability that the asset finishes above/below
  * the opening strike using Binance spot price, compares to the Polymarket
  * contract mid, and generates signals when edge exceeds the threshold.
- *
- * Two signal modes:
- *   1. Latency-arb (t > 90s): exploits 3-7s repricing lag
- *   2. Certainty-arb (0 < t ≤ 90s): exploits slow repricing as outcome
- *      becomes certain; requires higher edge, uses smaller size
  *
  * Signal flow:
  *   1. Binance tick → update spot price, delta, vol estimate
@@ -73,9 +63,12 @@ export class Strategy {
     this.tokenIdNo = null;
     this.marketEndDate = null;
 
-    // Dynamic strike: spot price at market open (captured on first tick after setMarket)
-    // For updown contracts the strike is the opening price, not a fixed level.
+    // Dynamic strike: Chainlink oracle price at window open (set by ArbEngine after
+    // fetching from Polygon RPC). Falls back to first Binance tick if Chainlink fails.
     this.marketOpenStrike = null;
+    // True while the Chainlink fetch is in-flight — prevents the Binance tick guard
+    // from racing in and setting a less-accurate strike before Chainlink returns.
+    this._chainlinkStrikePending = false;
 
     // Tracks how many market rotations have occurred.
     // The startup window is unreliable because the engine may start mid-window,
@@ -83,12 +76,22 @@ export class Strategy {
     // Signals are suppressed until the first rotation, when we know we're at window start.
     this.marketSetCount = 0;
 
+    // Spot order flow imbalance (from Binance depth)
+    this.spotImbalance = 0;
+
+    // Feature logging throttle: max 1 write/sec/strategy
+    this._lastFeatureLogMs = 0;
+
     // Signal listeners
     this._onSignal = null;
 
     // Live bankroll getter — injected by ArbEngine so sizing uses current bankroll,
     // not the static CONFIG value captured at startup.
     this._getBankroll = null;
+
+    // Calibration table — injected by ArbEngine on startup if historical data exists.
+    // When present, modelProb is adjusted before edge calculation.
+    this.calibration = null;
   }
 
   /**
@@ -103,7 +106,8 @@ export class Strategy {
     this.marketWindowStart = endDate
       ? new Date(endDate).getTime() - this.windowMs
       : null;
-    this.marketOpenStrike = null; // captured on first spot tick after window opens
+    this.marketOpenStrike = null;
+    this._chainlinkStrikePending = true; // hold off Binance capture until Chainlink resolves
     this.marketSetCount++;
     const isStartup = this.marketSetCount === 1;
     log.info(`[${this.label}] Market updated`, {
@@ -118,6 +122,25 @@ export class Strategy {
 
   onSignal(handler) {
     this._onSignal = handler;
+  }
+
+  /**
+   * Set the strike price from Chainlink oracle data.
+   * Called by ArbEngine after the Polygon RPC fetch resolves.
+   * Clears the pending flag so the Binance guard doesn't also fire.
+   */
+  setStrike(price) {
+    this.marketOpenStrike = price;
+    this._chainlinkStrikePending = false;
+    log.info(`[${this.label}] Strike set from Chainlink`, { strike: `$${price.toFixed(4)}` });
+  }
+
+  /**
+   * Clear the Chainlink pending flag without setting a strike, allowing the
+   * next Binance tick to capture it as a fallback. Called on Chainlink failure.
+   */
+  clearStrikePending() {
+    this._chainlinkStrikePending = false;
   }
 
   /**
@@ -142,14 +165,15 @@ export class Strategy {
   onSpotUpdate(data) {
     this.spotPrice = data.mid;
     this.spotDelta = data.delta;
+    this.spotImbalance = data.imbalance || 0;
     this.lastSpotUpdate = data.timestamp;
 
-    // Capture market open strike on the first spot tick after the window opens.
-    // Don't capture during pre-window period (market accepting orders before start).
+    // Capture market open strike from first Binance tick — only if Chainlink hasn't
+    // provided one and the Chainlink fetch is not still in-flight.
     const windowOpen = !this.marketWindowStart || Date.now() >= this.marketWindowStart;
-    if (this.marketOpenStrike === null && this.marketEndDate !== null && windowOpen) {
+    if (this.marketOpenStrike === null && !this._chainlinkStrikePending && this.marketEndDate !== null && windowOpen) {
       this.marketOpenStrike = data.mid;
-      log.info(`[${this.label}] Market open strike captured`, {
+      log.info(`[${this.label}] Market open strike captured (Binance fallback)`, {
         strike: `$${data.mid.toFixed(2)}`,
         market: this.marketEndDate,
       });
@@ -183,49 +207,109 @@ export class Strategy {
     this._evaluate();
   }
 
+  // ─── FEATURE LOGGING ────────────────────────────────────────────────
+  /**
+   * Build a feature row from the current strategy state and log it.
+   * Throttled to max 1 write/sec/strategy to avoid disk I/O flood.
+   */
+  _logFeature(extra) {
+    const now = Date.now();
+    if (now - this._lastFeatureLogMs < 1000) return;
+    this._lastFeatureLogMs = now;
+
+    const spread = (this.contractBestAsk || 0) - (this.contractBestBid || 0);
+    const feedLag = Math.abs(this.lastSpotUpdate - this.lastContractUpdate);
+
+    logFeature({
+      timestamp: now,
+      asset: this.asset,
+      windowMins: this.windowMins,
+      label: this.label,
+      spotPrice: this.spotPrice,
+      strikePrice: this.marketOpenStrike,
+      contractMid: this.contractMid,
+      contractBestBid: this.contractBestBid,
+      contractBestAsk: this.contractBestAsk,
+      spread,
+      contractBidDepth: this.contractBidDepth,
+      contractAskDepth: this.contractAskDepth,
+      vol: this.volEma.value || CONFIG.strategy.volMap[this.asset],
+      hoursToExpiry: this._estimateHoursToExpiry(),
+      feedLag,
+      spotDelta: this.spotDelta,
+      spotImbalance: this.spotImbalance,
+      ...extra,
+    });
+  }
+
+  // ─── DYNAMIC THRESHOLD ──────────────────────────────────────────────
+  /**
+   * Compute entry threshold adjusted for current microstructure conditions.
+   * Widens threshold when spread is wide, book is thin, or vol is elevated.
+   */
+  _dynamicThreshold() {
+    const base = this.windowMins >= 15
+      ? CONFIG.strategy.entryThresholdLong
+      : CONFIG.strategy.entryThreshold;
+    let adj = 0;
+
+    // Wide spread: if spread > 4c, add half the excess to threshold
+    const spread = (this.contractBestAsk || 0) - (this.contractBestBid || 0);
+    if (spread > 0.04) adj += (spread - 0.04) * 0.5;
+
+    // Thin book: if relevant-side depth < $20, add 2% to threshold
+    const minDepth = Math.min(this.contractBidDepth || 0, this.contractAskDepth || 0);
+    if (minDepth < 20) adj += 0.02;
+
+    // Elevated vol: if realized vol > 2x base vol, add 1% to threshold
+    const baseVol = CONFIG.strategy.volMap[this.asset];
+    if ((this.volEma.value || baseVol) > baseVol * 2) adj += 0.01;
+
+    return base + adj;
+  }
+
   // ─── CORE EVALUATION ───────────────────────────────────────────────
   _evaluate() {
     if (!this.spotPrice || !this.contractMid) return;
 
     // Suppress signals on the startup window: the engine may have started mid-window,
     // so the captured strike is not the true contract opening price.
-    if (this.marketSetCount <= 1) return;
+    if (this.marketSetCount <= 1) {
+      this._logFeature({ outcome: "suppressed_startup" });
+      return;
+    }
 
     // Suppress signals before the window officially opens (pre-market period).
     // Prices during this period reflect speculation about opening levels, not real lag.
-    if (this.marketWindowStart && Date.now() < this.marketWindowStart) return;
+    if (this.marketWindowStart && Date.now() < this.marketWindowStart) {
+      this._logFeature({ outcome: "suppressed_pre_window" });
+      return;
+    }
 
     // No strike captured yet (window just opened, waiting for first Binance tick).
     if (!this.marketOpenStrike) return;
 
-    // 15m+ windows stay near 50¢ longer and have better book depth — lower threshold is appropriate.
-    const threshold = this.windowMins >= 15
-      ? CONFIG.strategy.entryThresholdLong
-      : CONFIG.strategy.entryThreshold;
+    const threshold = this._dynamicThreshold();
     const strikePrice = this.marketOpenStrike;
 
-    const dailyVol = CONFIG.strategy.volMap[this.asset];                                              
+    const dailyVol = CONFIG.strategy.volMap[this.asset];
     const vol = this.volEma.value || dailyVol;
     const hoursToExpiry = this._estimateHoursToExpiry();
 
-    // Route to appropriate signal mode based on time remaining
     if (hoursToExpiry <= 0) return; // expired
 
-    const secsToExpiry = hoursToExpiry * 3600;
-    if (secsToExpiry <= CERTAINTY_WINDOW_SECS) {
-      // Certainty-arb window (0–90s): book thins, but large moves create genuine edge
-      this._evaluateCertainty(hoursToExpiry, vol);
+    // Latency-arb
+    const rawModelProb = impliedProbability(this.spotPrice, strikePrice, vol, hoursToExpiry);
+    const modelProb = this.calibration?.adjust(rawModelProb) ?? rawModelProb;
+
+    // Model saturation guard: when N(d2) is outside (0.10, 0.90), the BS formula is in
+    // a tiny-T singularity (spot far from strike with little time left). Apparent edge
+    // in either direction (deep ITM or deep OTM) is phantom — the Chainlink TWAP oracle
+    // has already committed to the outcome and books are too thin to fill at fair value.
+    if (modelProb > MODEL_SATURATION_THRESHOLD || modelProb < 1 - MODEL_SATURATION_THRESHOLD) {
+      this._logFeature({ outcome: "suppressed_saturation", modelProb, threshold });
       return;
     }
-
-    // Normal latency-arb (t > 90s)
-    const modelProb = impliedProbability(this.spotPrice, strikePrice, vol, hoursToExpiry);
-
-    // Model saturation guard: when N(d2) > 90% outside the certainty window, the BS
-    // formula is in a tiny-T singularity (spot far from strike, little time left). The
-    // Chainlink oracle resolves against a ~1-min TWAP, not spot tick — the apparent edge
-    // is not real and books are too thin to fill anyway.
-    if (modelProb > MODEL_SATURATION_THRESHOLD) return;
 
     const edge = calculateEdge(modelProb, this.contractMid);
     const smoothedEdge = this.edgeEma.update(edge.absolute);
@@ -234,74 +318,45 @@ export class Strategy {
     const feedLag = Math.abs(this.lastSpotUpdate - this.lastContractUpdate);
     // Beyond STALE_CONTRACT_MAX_MS the lag reflects a polling failure (REST error / 429 exhausted),
     // not genuine Polymarket repricing — the book we see is frozen, not lagging.
-    if (feedLag > STALE_CONTRACT_MAX_MS) return;
+    if (feedLag > STALE_CONTRACT_MAX_MS) {
+      this._logFeature({
+        outcome: "suppressed_stale", modelProb, threshold,
+        edgeAbsolute: edge.absolute, edgeDirection: edge.direction, smoothedEdge,
+      });
+      return;
+    }
     const isStale = feedLag > 1000; // contract at least 1s behind spot
-    const edgeConfirmed = smoothedEdge >= threshold && edge.absolute >= threshold;
+
+    // Recompute edge vs the actual executable fill price (bestAsk for BUY_YES, bestBid for BUY_NO)
+    // to avoid signaling on inside-spread phantom edges that disappear at execution.
+    const executablePrice = edge.direction === "BUY_YES"
+      ? (this.contractBestAsk || this.contractMid + 0.005)
+      : (this.contractBestBid || this.contractMid - 0.005);
+    const executableEdge = edge.direction === "BUY_YES"
+      ? modelProb - executablePrice
+      : executablePrice - modelProb;
+
+    const edgeConfirmed = smoothedEdge >= threshold && edge.absolute >= threshold && executableEdge >= threshold;
+
+    const featureExtra = {
+      modelProb, threshold,
+      edgeAbsolute: edge.absolute, edgeDirection: edge.direction,
+      smoothedEdge, executableEdge,
+    };
 
     if (edgeConfirmed && isStale && this._onSignal) {
-      this._fireSignal({ edge, modelProb, smoothedEdge, feedLag, vol, hoursToExpiry, isCertainty: false });
+      this._logFeature({ ...featureExtra, outcome: "fired" });
+      this._fireSignal({ edge, modelProb, smoothedEdge, feedLag, vol, hoursToExpiry });
+    } else {
+      const reason = !isStale ? "suppressed_not_stale" : "suppressed_edge";
+      this._logFeature({ ...featureExtra, outcome: reason });
     }
   }
 
-  /**
-   * Certainty-arb: last 90 seconds of the window.
-   * Polymarket often lags badly here as traders withdraw orders.
-   * If price has moved materially from strike, edge can be massive.
-   */
-  _evaluateCertainty(hoursToExpiry, vol) {
-    const { certaintyThreshold, certaintyMaxFraction } = CONFIG.strategy;
-    const strikePrice = this.marketOpenStrike;
-
-    const modelProb = impliedProbability(this.spotPrice, strikePrice, vol, hoursToExpiry);
-    const edge = calculateEdge(modelProb, this.contractMid);
-
-    // Track edge even in certainty mode
-    this.edgeStats.push(edge.absolute);
-    this.edgeEma.update(edge.absolute);
-
-    // Don't enter if the market has already priced in the certainty.
-    // When the token we'd buy is below CERTAINTY_MIN_PRICE (e.g. NO at 12¢ while market
-    // prices YES at 88¢), the book has committed to the outcome. The BS vol model is
-    // calibrated to 30-day realized vol and underestimates near-expiry resolution
-    // certainty — the apparent edge is phantom, and each entry gets stop-lossed as the
-    // losing token collapses toward zero.
-    const tokenSidePrice = edge.direction === "BUY_YES"
-      ? this.contractMid
-      : 1 - this.contractMid;
-    if (tokenSidePrice < CERTAINTY_MIN_PRICE) return;
-
-    // Require large edge — the book is thin and execution slippage is elevated
-    if (edge.absolute < certaintyThreshold) return;
-
-    const feedLag = Math.abs(this.lastSpotUpdate - this.lastContractUpdate);
-    if (feedLag < 1000) return; // still need to see staleness
-
-    const msRemaining = new Date(this.marketEndDate).getTime() - Date.now();
-    if (msRemaining < MIN_EXPIRY_BUFFER_MS) return; // too close to expiry for safe execution
-
-    const smallRisk = { ...CONFIG.risk, maxBetFraction: certaintyMaxFraction };
-    const sizing = calculatePositionSize(this._liveBankroll(), edge, this.contractMid, smallRisk);
-    if (!sizing) return;
-
-    const expiresAt = Date.now() + Math.max(msRemaining - MIN_EXPIRY_BUFFER_MS, 1000);
-
-    this._fireSignal({
-      edge,
-      modelProb,
-      smoothedEdge: this.edgeEma.value,
-      feedLag,
-      vol,
-      hoursToExpiry,
-      isCertainty: true,
-      expiresAt,
-      sizingOverride: sizing,
-    });
-  }
-
-  _fireSignal({ edge, modelProb, smoothedEdge, feedLag, vol, hoursToExpiry, isCertainty, expiresAt, sizingOverride }) {
+  _fireSignal({ edge, modelProb, smoothedEdge, feedLag, vol, hoursToExpiry }) {
     if (!this._onSignal) return;
 
-    const sizing = sizingOverride || calculatePositionSize(
+    const sizing = calculatePositionSize(
       this._liveBankroll(),
       edge,
       this.contractMid,
@@ -317,14 +372,20 @@ export class Strategy {
       ? this.contractAskDepth
       : this.contractBidDepth;
 
+    // Guard: Polymarket binary tokens trade strictly in (0, 1). Prices outside this
+    // range are non-tradeable (≤0 = worthless, ≥1 = certain) and would cause the
+    // executor to place an order that the exchange will always reject.
+    if (entryPrice <= 0 || entryPrice >= 1) {
+      log.warn(`[${this.label}] entryPrice ${entryPrice.toFixed(4)} out of (0,1) — signal suppressed`);
+      return;
+    }
+
     const signal = {
       timestamp: Date.now(),
       asset: this.asset,
       windowMins: this.windowMins,
       label: this.label,
       direction: edge.direction,
-      isCertainty: isCertainty || false,
-      ...(expiresAt && { expiresAt }),
       tokenId,
       entryPrice,
       size: sizing.netSize,
@@ -346,7 +407,7 @@ export class Strategy {
     };
 
     this.signalCount++;
-    log.info(`[${this.label}] ${isCertainty ? "Certainty" : "Signal"} generated`, {
+    log.info(`[${this.label}] Signal generated`, {
       direction: signal.direction,
       edge: `${(signal.edge * 100).toFixed(1)}%`,
       model: `${(modelProb * 100).toFixed(1)}%`,
@@ -354,7 +415,6 @@ export class Strategy {
       spot: `$${this.spotPrice.toFixed(2)}`,
       lag: `${feedLag}ms`,
       size: `$${signal.size.toFixed(2)}`,
-      ...(isCertainty && { secsLeft: Math.round(hoursToExpiry * 3600), window: CERTAINTY_WINDOW_SECS }),
     });
 
     this._onSignal(signal);

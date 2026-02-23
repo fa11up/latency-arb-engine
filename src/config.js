@@ -77,10 +77,6 @@ export const CONFIG = Object.freeze({
       SOL: envNum("SOL_VOL", 0.030),  // SOL ~3.0% daily
       XRP: envNum("XRP_VOL", 0.035),  // XRP ~3.5% daily
     },
-    // Certainty-arb mode: trades in the last 90s as outcome approaches certainty.
-    // Higher threshold required — book is thin and execution risk is elevated.
-    certaintyThreshold: envNum("CERTAINTY_THRESHOLD", 0.15),
-    certaintyMaxFraction: envNum("CERTAINTY_MAX_FRACTION", 0.02),
   },
 
   // ─── Risk ─────────────────────────────────────────────────────────

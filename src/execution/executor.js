@@ -57,6 +57,65 @@ function normalizeStatus(raw) {
   return (raw ?? "").toString().toUpperCase();
 }
 
+// ─── FILL PROBABILITY TRACKER ─────────────────────────────────────────────────
+/**
+ * Tracks fill rates bucketed by spread and depth conditions.
+ * Used to gate signals with historically low fill probability.
+ */
+export class FillTracker {
+  constructor() {
+    // Keyed by "spreadBucket:depthBucket" → { filled, total }
+    this._buckets = new Map();
+  }
+
+  _spreadBucket(signal) {
+    const spread = (signal.contractPrice != null && signal.entryPrice != null)
+      ? Math.abs(signal.entryPrice - signal.contractPrice) * 2
+      : 0;
+    // Use signal-level spread data if available
+    const s = signal._spread ?? spread;
+    if (s < 0.02) return "narrow";
+    if (s <= 0.05) return "medium";
+    return "wide";
+  }
+
+  _depthBucket(signal) {
+    const depth = signal.availableLiquidity ?? 0;
+    if (depth < 20) return "thin";
+    if (depth <= 100) return "ok";
+    return "deep";
+  }
+
+  _key(signal) {
+    return `${this._spreadBucket(signal)}:${this._depthBucket(signal)}`;
+  }
+
+  record(signal, fillStatus) {
+    const key = this._key(signal);
+    if (!this._buckets.has(key)) this._buckets.set(key, { filled: 0, total: 0 });
+    const bucket = this._buckets.get(key);
+    bucket.total++;
+    if (fillStatus === "MATCHED" || fillStatus === "PARTIAL") {
+      bucket.filled++;
+    }
+  }
+
+  fillProbability(signal) {
+    const key = this._key(signal);
+    const bucket = this._buckets.get(key);
+    if (!bucket || bucket.total < 10) return 1.0; // insufficient data
+    return bucket.filled / bucket.total;
+  }
+
+  getStatus() {
+    const result = {};
+    for (const [key, bucket] of this._buckets) {
+      result[key] = { ...bucket, rate: bucket.total > 0 ? bucket.filled / bucket.total : 0 };
+    }
+    return result;
+  }
+}
+
 /**
  * Execution layer.
  *
@@ -85,6 +144,7 @@ export class Executor {
 
     this.pnlStats = new RunningStats();
     this.fillRateStats = { attempted: 0, filled: 0, partial: 0, cancelled: 0, failed: 0 };
+    this.fillTracker = new FillTracker();
     this.executionLatencies = [];
 
     this.tradeHistory = [];
@@ -134,6 +194,7 @@ export class Executor {
       openTime: trade.openTime,
       exitTime: trade.exitTime,
       estimatedExit: estimated,
+      adverseSelection: trade._adverseSelection || [],
     });
 
     this.onTradeEvent?.({ type: "close", trade, estimated });
@@ -205,49 +266,138 @@ export class Executor {
     return { status: "TIMEOUT", avgPrice: null, filledQty: 0 };
   }
 
+  // ─── ORDER STRATEGY SELECTION ──────────────────────────────────────
+  /**
+   * Determine whether to take (cross the spread) or post as maker.
+   *
+   * Returns { type: "take"|"maker", price }
+   *   - Wide spread (>= 3c) AND > 120s to expiry: post maker inside the spread
+   *   - Otherwise: take at executable price (current behavior)
+   */
+  _selectOrderStrategy(signal) {
+    const secsToExpiry = signal.hoursToExpiry * 3600;
+    const spread = signal.direction === "BUY_YES"
+      ? (signal.entryPrice - (signal.contractPrice - (signal.entryPrice - signal.contractPrice)))
+      : 0;
+    // Compute spread from signal context
+    const bestBid = signal.contractPrice - (signal.entryPrice - signal.contractPrice);
+    const bestAsk = signal.direction === "BUY_YES" ? signal.entryPrice : undefined;
+    const actualSpread = signal._spread ?? Math.abs(signal.entryPrice - signal.contractPrice) * 2;
+
+    if (actualSpread >= 0.03 && secsToExpiry > 120) {
+      // Post maker inside the spread: bestBid + 1c for BUY_YES
+      const makerPrice = signal.direction === "BUY_YES"
+        ? signal.contractPrice + 0.01  // just inside from mid toward ask
+        : signal.contractPrice - 0.01; // just inside from mid toward bid (for BUY_NO: want lower YES price)
+
+      // Clamp to (0, 1)
+      const clampedPrice = Math.max(0.01, Math.min(0.99, makerPrice));
+
+      return { type: "maker", price: clampedPrice };
+    }
+
+    return { type: "take", price: signal.entryPrice };
+  }
+
   // ─── EXECUTE SIGNAL ─────────────────────────────────────────────────
   async execute(signal) {
     const start = Date.now();
     this.fillRateStats.attempted++;
 
     try {
-      const requestedQty = signal.size / signal.entryPrice; // tokens requested
+      const orderStrategy = this._selectOrderStrategy(signal);
+      const entryPrice = orderStrategy.price;
+      const requestedQty = signal.size / entryPrice; // tokens requested
 
       const orderParams = {
         tokenId: signal.tokenId,
         side: "BUY",
-        price: signal.entryPrice,
+        price: entryPrice,
         size: requestedQty,
         orderType: "GTC",
       };
 
-      log.trade(`Executing: ${signal.direction} $${signal.size.toFixed(2)} @ ${signal.entryPrice.toFixed(4)}`, {
+      log.trade(`Executing: ${signal.direction} $${signal.size.toFixed(2)} @ ${entryPrice.toFixed(4)} [${orderStrategy.type}]`, {
         edge: `${(signal.edge * 100).toFixed(1)}%`,
         model: `${(signal.modelProb * 100).toFixed(1)}%`,
         spot: `$${signal.spotPrice.toFixed(1)}`,
       });
 
-      const order = await this.poly.placeOrder(orderParams);
+      let order = await this.poly.placeOrder(orderParams);
       const latency = Date.now() - start;
       this.executionLatencies.push(latency);
       if (this.executionLatencies.length > 100) this.executionLatencies.shift();
 
       // ── Fill confirmation (live only) ──────────────────────────────
-      let actualEntryPrice = signal.entryPrice;
+      let actualEntryPrice = entryPrice;
       let actualTokenQty   = requestedQty;
 
       if (order.status !== "SIMULATED") {
-        const fill = await this._waitForFill(order.id, requestedQty, FILL_TIMEOUT_MS);
+        let fill;
+
+        if (orderStrategy.type === "maker") {
+          // Maker order: allow reprice up to MAX_REPRICES if not filled within 2s
+          const MAX_REPRICES = 2;
+          let reprices = 0;
+          fill = await this._waitForFill(order.id, requestedQty, MONITOR_INTERVAL_MS);
+
+          while (fill.status === "TIMEOUT" && fill.filledQty === 0 && reprices < MAX_REPRICES) {
+            // Cancel stale maker order and reprice closer to market
+            try { await this.poly.cancelOrder(order.id); } catch { /* best effort */ }
+            reprices++;
+
+            // Fetch updated book for reprice
+            let newPrice = entryPrice;
+            try {
+              const book = await this.poly.fetchOrderbook(signal.tokenId);
+              if (book) {
+                // Move price 1c closer to the taker side
+                newPrice = signal.direction === "BUY_YES"
+                  ? Math.min((book.bestAsk ?? entryPrice), entryPrice + 0.01 * reprices)
+                  : Math.max((book.bestBid ?? entryPrice), entryPrice - 0.01 * reprices);
+                newPrice = Math.max(0.01, Math.min(0.99, newPrice));
+              }
+            } catch { /* use previous price */ }
+
+            log.trade(`[${signal.label}] Maker reprice #${reprices}: ${entryPrice.toFixed(4)} → ${newPrice.toFixed(4)}`);
+
+            const repriceQty = signal.size / newPrice;
+            order = await this.poly.placeOrder({
+              ...orderParams,
+              price: newPrice,
+              size: repriceQty,
+            });
+            fill = await this._waitForFill(order.id, repriceQty, MONITOR_INTERVAL_MS);
+          }
+
+          // After MAX_REPRICES exhausted, fall through to taker if still unfilled
+          if (fill.status === "TIMEOUT" && fill.filledQty === 0) {
+            try { await this.poly.cancelOrder(order.id); } catch { /* best effort */ }
+            log.trade(`[${signal.label}] Maker exhausted ${MAX_REPRICES} reprices — taking`);
+
+            const takeQty = signal.size / signal.entryPrice;
+            order = await this.poly.placeOrder({
+              ...orderParams,
+              price: signal.entryPrice,
+              size: takeQty,
+            });
+            fill = await this._waitForFill(order.id, takeQty, FILL_TIMEOUT_MS);
+          }
+        } else {
+          fill = await this._waitForFill(order.id, requestedQty, FILL_TIMEOUT_MS);
+        }
+
+        this.fillTracker.record(signal, fill.status);
 
         if (fill.status === "MATCHED") {
-          actualEntryPrice = fill.avgPrice ?? signal.entryPrice;
+          actualEntryPrice = fill.avgPrice ?? entryPrice;
           actualTokenQty   = fill.filledQty;
           this.fillRateStats.filled++;
 
         } else if (fill.status === "PARTIAL" && fill.filledQty > 0) {
           // Cancel the unfilled remainder, then open a position for what filled.
           try { await this.poly.cancelOrder(order.id); } catch { /* best effort */ }
-          actualEntryPrice = fill.avgPrice ?? signal.entryPrice;
+          actualEntryPrice = fill.avgPrice ?? entryPrice;
           actualTokenQty   = fill.filledQty;
           this.fillRateStats.partial++;
           log.warn(`[${signal.label}] Partial fill: ${fill.filledQty.toFixed(4)} of ${requestedQty.toFixed(4)} tokens @ ${actualEntryPrice.toFixed(4)}`);
@@ -317,7 +467,7 @@ export class Executor {
         spotPrice: signal.spotPrice,
         strikePrice: signal.strikePrice,
         openTime: trade.openTime,
-        isCertainty: signal.isCertainty || false,
+        realizedSlippage: actualEntryPrice - signal.entryPrice,
       });
 
       this._monitorPosition(trade);
@@ -338,9 +488,7 @@ export class Executor {
   // ─── POSITION MONITORING ────────────────────────────────────────────
   _monitorPosition(trade) {
     const checkInterval = MONITOR_INTERVAL_MS;
-    const maxHoldMs = trade.signal.isCertainty
-      ? Math.max((trade.signal.expiresAt || 0) - trade.openTime, FILL_TIMEOUT_MS)
-      : MAX_HOLD_MS;
+    const maxHoldMs = MAX_HOLD_MS;
     const profitTarget = CONFIG.risk.profitTargetPct;
     const stopLoss = -CONFIG.risk.stopLossPct;
 
@@ -366,13 +514,26 @@ export class Executor {
       trade.currentMid = currentMid;
       trade.unrealizedPnl = unrealizedPnl;
 
+      // Adverse selection checkpoints: snapshot P&L at 5s, 15s, 30s after open
+      if (!trade._adverseSelection) trade._adverseSelection = [];
+      const ageSec = (Date.now() - trade.openTime) / 1000;
+      for (const cp of [5, 15, 30]) {
+        if (ageSec >= cp && !trade._adverseSelection.some(s => s.checkpoint === cp)) {
+          trade._adverseSelection.push({
+            checkpoint: cp,
+            currentMid,
+            midMove: currentMid - trade.entryPrice,
+            pnlPct: unrealizedPnl / trade.size,
+          });
+        }
+      }
+
       let shouldExit = false;
       let exitReason = "";
 
-      if (age >= maxHoldMs)                                                  { shouldExit = true; exitReason = "MAX_HOLD_TIME"; }
-      if (pnlPct >= profitTarget)                                            { shouldExit = true; exitReason = "PROFIT_TARGET"; }
-      if (pnlPct <= stopLoss)                                                { shouldExit = true; exitReason = "STOP_LOSS"; }
-      if (trade.signal.isCertainty && Date.now() >= trade.signal.expiresAt) { shouldExit = true; exitReason = "CERTAINTY_EXPIRY"; }
+      if (age >= maxHoldMs)     { shouldExit = true; exitReason = "MAX_HOLD_TIME"; }
+      if (pnlPct >= profitTarget) { shouldExit = true; exitReason = "PROFIT_TARGET"; }
+      if (pnlPct <= stopLoss)   { shouldExit = true; exitReason = "STOP_LOSS"; }
 
       const targetPrice = trade.direction === "BUY_YES" ? trade.signal.modelProb : 1 - trade.signal.modelProb;
       if (Math.abs(currentMid - targetPrice) < 0.02) { shouldExit = true; exitReason = "EDGE_COLLAPSED"; }
@@ -553,8 +714,16 @@ export class Executor {
       } catch (err) {
         log.error(`Failed to cancel order ${trade.id}`, { error: err.message });
       }
-      this.openOrders.delete(trade.id);
-      this.risk.closePosition(trade.id, 0);
+      // Use _finalizeClose so rotation cancels are recorded in tradeHistory / pnlStats
+      // and emitted to logTrade — identical treatment to SHUTDOWN closes.
+      const markPrice = trade.currentMid ?? trade.entryPrice;
+      const pnl = (markPrice - trade.entryPrice) * (trade.tokenQty ?? 0);
+      this._finalizeClose(trade, {
+        reason: "ROTATION_CANCEL",
+        exitPrice: markPrice,
+        pnl,
+        estimated: true,
+      });
     }
     this.onTradeEvent?.({ type: "rotation_cancel", label });
   }
@@ -638,7 +807,6 @@ export class Executor {
         unrealizedPnl: t.unrealizedPnl,
         size: t.size,
         openTime: t.openTime,
-        isCertainty: t.signal.isCertainty || false,
       })),
       fillRate: this.fillRateStats,
       avgExecutionLatency: Math.round(avgLatency),

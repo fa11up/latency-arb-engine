@@ -167,7 +167,7 @@ export class TUI {
     } else {
       tradeRows = openTrades.map(t => {
         const label = (t.label || "—").padEnd(tCols.label);
-        const dir   = (t.isCertainty ? `${t.direction}*` : t.direction).padEnd(tCols.dir);
+        const dir   = t.direction.padEnd(tCols.dir);
         const entry = `${(t.entryPrice * 100).toFixed(1)}¢`.padEnd(tCols.entry);
         const curr  = (t.currentMid != null ? `${(t.currentMid * 100).toFixed(1)}¢` : "—").padEnd(tCols.curr);
         const ageSec = Math.round((Date.now() - t.openTime) / 1000);

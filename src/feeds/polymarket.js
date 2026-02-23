@@ -5,6 +5,8 @@ import { createLogger } from "../utils/logger.js";
 
 const log = createLogger("POLYMARKET");
 
+const REST_TIMEOUT_MS = 10_000; // abort hung REST calls after 10s
+
 /**
  * Polymarket CLOB client.
  *
@@ -80,11 +82,14 @@ export class PolymarketFeed {
     const bodyStr = body ? JSON.stringify(body) : "";
     const start = Date.now();
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REST_TIMEOUT_MS);
     try {
       const resp = await fetch(url, {
         method,
         headers: this._headers(method, path, bodyStr),
         body: body ? bodyStr : undefined,
+        signal: controller.signal,
       });
 
       const latency = Date.now() - start;
@@ -108,6 +113,8 @@ export class PolymarketFeed {
     } catch (err) {
       log.error(`REST ${method} ${path} failed`, { error: err.message });
       throw err;
+    } finally {
+      clearTimeout(timer);
     }
   }
 

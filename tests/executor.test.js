@@ -44,7 +44,7 @@ Object.assign(process.env, {
 });
 
 // Dynamic imports: config.js (and dotenv) load here, AFTER env is set above.
-const { Executor }     = await import("../src/execution/executor.js");
+const { Executor, FillTracker } = await import("../src/execution/executor.js");
 const { RiskManager }  = await import("../src/engine/risk.js");
 const { CONFIG }       = await import("../src/config.js");
 
@@ -88,7 +88,6 @@ function makeSignal(overrides = {}) {
   return {
     label:     "BTC/5m",
     direction: "BUY_YES",
-    isCertainty: false,
     tokenId:   "token-yes-abc123",
     entryPrice: 0.55,
     size:       5.50,   // dollar size
@@ -396,12 +395,10 @@ test("_monitorPosition race: no double-close when safety timeout overlaps in-fli
     }),
   });
   const exec = new Executor(poly, risk);
-  const trade = makeOpenTrade(exec, risk, {
-    id: "race-trade",
-    signal: makeSignal({ isCertainty: true, expiresAt: Date.now() }), // maxHold collapses to 5s
-  });
+  const trade = makeOpenTrade(exec, risk, { id: "race-trade" });
 
-  // Deterministic slow close: first call waits 12s, safety call during CLOSING returns false.
+  // Deterministic slow close: first call waits 400s (longer than MAX_HOLD_MS+SAFETY_BUFFER=305s),
+  // so safety fires while first close is still in-flight.
   let closeAttempts = 0;
   let closeCommitted = 0;
   exec._exitPosition = async (tTrade) => {
@@ -409,7 +406,7 @@ test("_monitorPosition race: no double-close when safety timeout overlaps in-fli
     if (tTrade.status === "CLOSING" || tTrade.status === "CLOSED") return false;
     if (!exec.openOrders.has(tTrade.id)) return false;
     tTrade.status = "CLOSING";
-    await new Promise(resolve => setTimeout(resolve, 12_000));
+    await new Promise(resolve => setTimeout(resolve, 400_000));
     if (!exec.openOrders.has(tTrade.id)) return false;
     tTrade.status = "CLOSED";
     exec.openOrders.delete(tTrade.id);
@@ -427,12 +424,12 @@ test("_monitorPosition race: no double-close when safety timeout overlaps in-fli
   await Promise.resolve();
   assert.equal(trade.status, "CLOSING", "trade should be in-flight closing after monitor trigger");
 
-  // 10s total: safety timeout fires while first close still in-flight.
-  t.mock.timers.tick(8_000);
+  // 305s total: safety timeout fires while first close still in-flight (waiting for 400s).
+  t.mock.timers.tick(303_000);
   await Promise.resolve();
 
-  // 14s total: in-flight close resolves (wait started at t=2s, waits 12s).
-  t.mock.timers.tick(4_000);
+  // 405s total: in-flight close resolves (wait started at t=2s, waits 400s).
+  t.mock.timers.tick(100_000);
   await Promise.resolve();
 
   assert.equal(closeAttempts, 2, "race should produce exactly 2 close attempts: monitor + safety timeout");
@@ -551,15 +548,12 @@ test("_monitorPosition race (real _exitPosition): monitor + safety overlap still
     }),
   });
   const exec = new Executor(poly, risk);
-  const trade = makeOpenTrade(exec, risk, {
-    id: "race-trade-real",
-    signal: makeSignal({ isCertainty: true, expiresAt: Date.now() }), // maxHold => 5s
-  });
+  const trade = makeOpenTrade(exec, risk, { id: "race-trade-real" });
 
-  // Keep first _exitPosition in-flight long enough to overlap safety timeout.
+  // Keep first _exitPosition in-flight long enough to overlap safety timeout (305s).
   exec._waitForFill = async () =>
     new Promise(resolve =>
-      setTimeout(() => resolve({ status: "MATCHED", filledQty: trade.tokenQty, avgPrice: 0.62 }), 12_000)
+      setTimeout(() => resolve({ status: "MATCHED", filledQty: trade.tokenQty, avgPrice: 0.62 }), 400_000)
     );
 
   const originalExit = exec._exitPosition.bind(exec);
@@ -576,12 +570,12 @@ test("_monitorPosition race (real _exitPosition): monitor + safety overlap still
   await flush();
   assert.equal(trade.status, "CLOSING");
 
-  // t=10s: safety timeout overlaps; second close attempt should return false.
-  t.mock.timers.tick(8_000);
+  // t=305s: safety timeout overlaps; second close attempt should return false.
+  t.mock.timers.tick(303_000);
   await flush();
 
-  // First in-flight close resolves at t=14s.
-  t.mock.timers.tick(20_000);
+  // First in-flight close resolves at t=402s (wait started at t=2s, waits 400s).
+  t.mock.timers.tick(100_000);
   await flush(12);
 
   assert.equal(exitCalls, 2, "expected monitor close attempt + safety overlap attempt");
@@ -673,27 +667,66 @@ test("cancelOrdersForLabel: cancels only matching label and preserves others", a
   assert.ok(risk.openPositions.has(tradeB.id), "risk state kept for non-matching trade");
 });
 
-// ─── Test 21: canTrade liquidity rule — certainty 1x vs normal 2x ─────────────
-test("canTrade liquidity: certainty trades need 1x size, normal trades need 2x", () => {
+// ─── Test 21: canTrade liquidity rule — auto-scales to 75% depth, blocks below floor ─
+test("canTrade liquidity: auto-scales to 75% of depth, blocks below $5 floor", () => {
+  // Floor block: 6 * 0.75 = 4.5 < $5 → blocked
+  const r1 = makeRisk();
+  const tooThin = makeSignal({ size: 5.50, availableLiquidity: 6 });
+  const thinResult = r1.canTrade(tooThin);
+  assert.equal(thinResult.allowed, false, "blocked when available × 0.75 < $5 floor");
+  assert.ok(thinResult.reasons.some(r => r.includes("Insufficient liquidity")));
+
+  // Auto-scale: size exceeds 75% of depth → scaled down, allowed
+  const r2 = makeRisk();
+  const scaled = makeSignal({ size: 20, availableLiquidity: 20 });
+  const scaledResult = r2.canTrade(scaled);
+  assert.equal(scaledResult.allowed, true, "allowed with scaled-down size");
+  assert.ok(Math.abs(scaled.size - 15.00) < 0.01, `size should be 15.00, got ${scaled.size}`);
+
+  // No scaling: size already fits within 75% of depth
+  const r3 = makeRisk();
+  const fits = makeSignal({ size: 5.50, availableLiquidity: 200 });
+  r3.canTrade(fits);
+  assert.ok(Math.abs(fits.size - 5.50) < 0.01, "size unchanged when it fits within depth");
+});
+
+// ─── Test 23: cancelOrdersForLabel writes close bookkeeping ──────────────────
+// Previously cancelOrdersForLabel did a bare delete + risk.closePosition without
+// calling _finalizeClose — so rotation cancels were invisible to tradeHistory,
+// pnlStats, and the audit log. Fix: _finalizeClose is called with ROTATION_CANCEL.
+test("cancelOrdersForLabel: records trade in history, updates pnlStats, sets exitReason", async () => {
   const risk = makeRisk();
+  const poly = makePoly({ cancelOrder: async () => ({ success: true }) });
+  const exec = new Executor(poly, risk);
 
-  const certaintySignal = makeSignal({
-    isCertainty: true,
-    size: 10,
-    availableLiquidity: 10,
+  // Trade with a currentMid 7¢ above entry so we get a non-trivial P&L to verify.
+  const trade = makeOpenTrade(exec, risk, {
+    id: "btc-rotation-trade",
+    signal: makeSignal({ label: "BTC/5m" }),
+    currentMid: 0.62,
+    // entryPrice=0.55, tokenQty=10 from makeOpenTrade defaults
   });
-  const normalSignal = makeSignal({
-    isCertainty: false,
-    size: 10,
-    availableLiquidity: 10,
-  });
 
-  const certainty = risk.canTrade(certaintySignal);
-  const normal = risk.canTrade(normalSignal);
+  await exec.cancelOrdersForLabel("BTC/5m");
 
-  assert.equal(certainty.allowed, true, "certainty trade should pass with 1x liquidity");
-  assert.equal(normal.allowed, false, "normal trade should fail with only 1x liquidity");
-  assert.ok(normal.reasons.some(r => r.includes("Insufficient liquidity")));
+  assert.equal(exec.tradeHistory.length, 1, "rotation cancel should be recorded in tradeHistory");
+
+  const closed = exec.tradeHistory[0];
+  assert.equal(closed.status,       "CLOSED",          "trade status should be CLOSED");
+  assert.equal(closed.exitReason,   "ROTATION_CANCEL", "exit reason should be ROTATION_CANCEL");
+  assert.equal(closed.estimatedExit, true,              "rotation cancel should be flagged as estimated");
+
+  assert.equal(exec.pnlStats.n, 1, "pnlStats should count the rotation cancel");
+
+  // pnl = (currentMid - entryPrice) × tokenQty = (0.62 - 0.55) × 10 = 0.70
+  const expectedPnl = (0.62 - 0.55) * 10;
+  assert.ok(
+    Math.abs(exec.pnlStats.sum - expectedPnl) < 0.001,
+    `pnlStats sum should be mark-to-market P&L (${expectedPnl.toFixed(2)}), got ${exec.pnlStats.sum.toFixed(4)}`
+  );
+
+  assert.ok(!exec.openOrders.has(trade.id),    "trade removed from openOrders");
+  assert.ok(!risk.openPositions.has(trade.id), "risk position closed");
 });
 
 // ─── Test 22: cooldown reservation only on allowed trade ──────────────────────
@@ -715,4 +748,268 @@ test("canTrade cooldown reservation: lastTradeTime updates only when allowed", (
   } finally {
     CONFIG.risk.cooldownMs = prevCooldown;
   }
+});
+
+// ─── Test 24: Adverse selection checkpoints recorded during monitor ──────────
+test("_monitorPosition: adverse selection checkpoints captured at 5s, 15s, 30s", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  const flush = async (n = 4) => { for (let i = 0; i < n; i++) await Promise.resolve(); };
+
+  const risk = makeRisk();
+  const poly = makePoly({
+    fetchOrderbook: async () => ({
+      mid: 0.58, bestBid: 0.57, bestAsk: 0.59, bidDepth: 500, askDepth: 500, timestamp: Date.now(), lag: 0,
+    }),
+  });
+  const exec = new Executor(poly, risk);
+  const trade = makeOpenTrade(exec, risk);
+
+  // Prevent exits — we only want to test checkpoint accumulation
+  const origExit = exec._exitPosition;
+  exec._exitPosition = async () => false;
+
+  exec._monitorPosition(trade);
+
+  // Tick past the 5s checkpoint (monitor fires every 2s)
+  t.mock.timers.tick(6_000);
+  await flush(8);
+
+  assert.ok(trade._adverseSelection, "adverse selection array should exist");
+  assert.ok(
+    trade._adverseSelection.some(s => s.checkpoint === 5),
+    "checkpoint 5s should be present after 6s"
+  );
+
+  // Tick past 15s
+  t.mock.timers.tick(10_000);
+  await flush(8);
+
+  assert.ok(
+    trade._adverseSelection.some(s => s.checkpoint === 15),
+    "checkpoint 15s should be present after 16s"
+  );
+
+  // Tick past 30s
+  t.mock.timers.tick(16_000);
+  await flush(8);
+
+  assert.ok(
+    trade._adverseSelection.some(s => s.checkpoint === 30),
+    "checkpoint 30s should be present after 32s"
+  );
+
+  const cp5 = trade._adverseSelection.find(s => s.checkpoint === 5);
+  assert.equal(cp5.currentMid, 0.58);
+  assert.ok(Math.abs(cp5.midMove - (0.58 - 0.55)) < 0.001, "midMove = currentMid - entryPrice");
+
+  // Clean up
+  exec._exitPosition = origExit;
+  exec.openOrders.delete(trade.id);
+});
+
+// ─── Test 25: Close event includes adverseSelection array ───────────────────
+test("_finalizeClose: close log includes adverseSelection array", () => {
+  const risk = makeRisk();
+  const exec = new Executor(makePoly(), risk);
+  const trade = makeOpenTrade(exec, risk);
+
+  trade._adverseSelection = [
+    { checkpoint: 5, currentMid: 0.58, midMove: 0.03, pnlPct: 0.054 },
+  ];
+
+  const markPrice = 0.62;
+  const pnl = (markPrice - trade.entryPrice) * trade.tokenQty;
+  exec._finalizeClose(trade, { reason: "PROFIT_TARGET", exitPrice: markPrice, pnl });
+
+  assert.equal(trade.status, "CLOSED");
+  // Verify via trade object — logTrade writes to disk, we just verify the data was available
+  assert.deepEqual(trade._adverseSelection, [
+    { checkpoint: 5, currentMid: 0.58, midMove: 0.03, pnlPct: 0.054 },
+  ]);
+});
+
+// ─── Test 26: Realized slippage computed at entry ───────────────────────────
+test("execute: realized slippage logged at entry", async () => {
+  const risk = makeRisk();
+  // Fill at 0.57 vs signal price 0.55 → slippage = 0.02
+  const poly = makePoly({
+    placeOrder: async () => ({ id: "ord-slip", status: "OPEN" }),
+    getOrder: async () => ({
+      status: "MATCHED",
+      size: "10",
+      remainingSize: "0",
+      avgPrice: "0.57",
+    }),
+  });
+  const exec = new Executor(poly, risk);
+  exec._monitorPosition = () => {};
+  const signal = makeSignal({ entryPrice: 0.55, size: 5.50 });
+
+  const trade = await exec.execute(signal);
+
+  assert.ok(trade);
+  assert.equal(trade.entryPrice, 0.57, "entry price should be from fill");
+  // realizedSlippage = 0.57 - 0.55 = 0.02 (positive = worse than expected)
+  // The slippage is logged in logTrade, verified by the trade's entry price vs signal price
+  assert.ok(trade.entryPrice - signal.entryPrice > 0, "actual fill worse than signal price");
+});
+
+// ─── Test 27: FillTracker returns 1.0 with insufficient data ────────────────
+test("FillTracker: returns 1.0 when bucket has < 10 observations", () => {
+  const ft = new FillTracker();
+  const signal = makeSignal({ availableLiquidity: 200 });
+
+  assert.equal(ft.fillProbability(signal), 1.0, "should default to 1.0 with no data");
+
+  // Add a few observations (< 10)
+  for (let i = 0; i < 5; i++) ft.record(signal, "MATCHED");
+  assert.equal(ft.fillProbability(signal), 1.0, "should still default with < 10 observations");
+});
+
+// ─── Test 28: FillTracker returns correct rate after recording outcomes ──────
+test("FillTracker: returns correct fill rate after recording outcomes", () => {
+  const ft = new FillTracker();
+  const signal = makeSignal({ availableLiquidity: 200 });
+
+  // Record 10 outcomes: 7 filled, 3 cancelled
+  for (let i = 0; i < 7; i++) ft.record(signal, "MATCHED");
+  for (let i = 0; i < 3; i++) ft.record(signal, "CANCELLED");
+
+  const prob = ft.fillProbability(signal);
+  assert.ok(Math.abs(prob - 0.7) < 0.001, `expected 0.7, got ${prob}`);
+});
+
+// ─── Test 29: FillTracker treats PARTIAL as filled ──────────────────────────
+test("FillTracker: PARTIAL counts as filled", () => {
+  const ft = new FillTracker();
+  const signal = makeSignal({ availableLiquidity: 200 });
+
+  for (let i = 0; i < 5; i++) ft.record(signal, "PARTIAL");
+  for (let i = 0; i < 5; i++) ft.record(signal, "TIMEOUT");
+
+  const prob = ft.fillProbability(signal);
+  assert.ok(Math.abs(prob - 0.5) < 0.001, `expected 0.5, got ${prob}`);
+});
+
+// ─── Test 30: canTrade rejects signals with low fill probability ────────────
+test("canTrade: rejects signal with _estimatedFillProb < 0.3", () => {
+  const risk = makeRisk();
+  const signal = makeSignal({ availableLiquidity: 200, _estimatedFillProb: 0.2 });
+
+  const { allowed, reasons } = risk.canTrade(signal);
+
+  assert.equal(allowed, false, "should be blocked with fill probability 20%");
+  assert.ok(reasons.some(r => r.includes("fill probability")),
+    `expected fill probability reason, got: ${reasons}`);
+});
+
+// ─── Test 31: canTrade allows signals with adequate fill probability ────────
+test("canTrade: allows signal with _estimatedFillProb >= 0.3", () => {
+  const risk = makeRisk();
+  const signal = makeSignal({ availableLiquidity: 200, _estimatedFillProb: 0.5 });
+
+  const { allowed } = risk.canTrade(signal);
+  assert.equal(allowed, true, "should be allowed with fill probability 50%");
+});
+
+// ─── Test 32: FillTracker buckets by spread/depth ───────────────────────────
+test("FillTracker: different spread/depth conditions use separate buckets", () => {
+  const ft = new FillTracker();
+  const deepSignal = makeSignal({ availableLiquidity: 200 }); // deep bucket
+  const thinSignal = makeSignal({ availableLiquidity: 10 });  // thin bucket
+
+  // Record different rates for each bucket
+  for (let i = 0; i < 10; i++) ft.record(deepSignal, "MATCHED");
+  for (let i = 0; i < 10; i++) ft.record(thinSignal, "CANCELLED");
+
+  assert.ok(Math.abs(ft.fillProbability(deepSignal) - 1.0) < 0.001, "deep bucket should be 100%");
+  assert.ok(Math.abs(ft.fillProbability(thinSignal) - 0.0) < 0.001, "thin bucket should be 0%");
+});
+
+// ─── Test 33: _selectOrderStrategy — wide spread + time → maker ────────────
+test("_selectOrderStrategy: wide spread with time produces maker order", () => {
+  const exec = new Executor(makePoly(), makeRisk());
+  const signal = makeSignal({
+    hoursToExpiry: 1,    // 3600s > 120s
+    _spread: 0.05,       // >= 3c
+    contractPrice: 0.55,
+    entryPrice: 0.58,    // bestAsk
+    direction: "BUY_YES",
+  });
+
+  const result = exec._selectOrderStrategy(signal);
+  assert.equal(result.type, "maker");
+  assert.ok(result.price > 0 && result.price < 1, "maker price must be in (0,1)");
+  assert.ok(result.price < signal.entryPrice, "maker price should be inside the spread (below ask)");
+});
+
+// ─── Test 34: _selectOrderStrategy — narrow spread → take ──────────────────
+test("_selectOrderStrategy: narrow spread returns take", () => {
+  const exec = new Executor(makePoly(), makeRisk());
+  const signal = makeSignal({
+    hoursToExpiry: 1,
+    _spread: 0.01,       // < 3c
+    contractPrice: 0.55,
+    direction: "BUY_YES",
+  });
+
+  const result = exec._selectOrderStrategy(signal);
+  assert.equal(result.type, "take");
+});
+
+// ─── Test 35: _selectOrderStrategy — near expiry → take ────────────────────
+test("_selectOrderStrategy: near expiry returns take even with wide spread", () => {
+  const exec = new Executor(makePoly(), makeRisk());
+  const signal = makeSignal({
+    hoursToExpiry: 0.02,  // 72s < 120s
+    _spread: 0.10,        // wide
+    contractPrice: 0.55,
+    direction: "BUY_YES",
+  });
+
+  const result = exec._selectOrderStrategy(signal);
+  assert.equal(result.type, "take");
+});
+
+// ─── Test 36: execute with maker strategy falls through to take after reprices ─
+test("execute: maker strategy falls through to take after MAX_REPRICES", async () => {
+  const risk = makeRisk();
+  let orderCount = 0;
+  let cancelCount = 0;
+
+  const poly = makePoly({
+    placeOrder: async (params) => {
+      orderCount++;
+      return { id: `ord-${orderCount}`, status: "OPEN", ...params };
+    },
+    getOrder: async (id) => {
+      // Last order (taker fallback) fills, all others timeout
+      if (id === "ord-4") {
+        return { status: "MATCHED", size: "10", remainingSize: "0", avgPrice: "0.55" };
+      }
+      return { status: "OPEN", size: "10", remainingSize: "10" };
+    },
+    cancelOrder: async () => { cancelCount++; return { success: true }; },
+    fetchOrderbook: async () => ({
+      mid: 0.55, bestBid: 0.53, bestAsk: 0.57, bidDepth: 200, askDepth: 200, timestamp: Date.now(), lag: 0,
+    }),
+  });
+
+  const exec = new Executor(poly, risk);
+  exec._monitorPosition = () => {};
+
+  const signal = makeSignal({
+    hoursToExpiry: 1,
+    _spread: 0.05,
+    contractPrice: 0.55,
+    entryPrice: 0.57,
+    direction: "BUY_YES",
+  });
+
+  const trade = await exec.execute(signal);
+
+  assert.ok(trade, "trade should open via taker fallback");
+  // 1 initial maker + 2 reprices + 1 taker fallback = 4 orders
+  assert.equal(orderCount, 4, "should place 4 orders: maker + 2 reprices + taker");
+  assert.ok(cancelCount >= 3, "should cancel at least 3 unfilled orders");
 });

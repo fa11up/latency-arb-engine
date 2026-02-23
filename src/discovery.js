@@ -3,7 +3,8 @@ import { createLogger } from "./utils/logger.js";
 
 const log = createLogger("DISCOVERY");
 
-const PRE_FETCH_MS = 5000; // fetch next market 5s before current expires
+const PRE_FETCH_MS    = 5000; // fetch next market 5s before current expires
+const FETCH_TIMEOUT_MS = 8_000; // abort hung Gamma API calls after 8s
 
 /**
  * MarketDiscovery — auto-discovers and rotates crypto Up/Down contracts.
@@ -42,8 +43,10 @@ export class MarketDiscovery {
     const slug = this._buildSlug(alignedTs);
     const url = `${CONFIG.poly.gammaApiUrl}/markets/slug/${slug}`;
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
-      const resp = await fetch(url);
+      const resp = await fetch(url, { signal: controller.signal });
       if (!resp.ok) {
         log.debug(`Market not found: ${slug} (HTTP ${resp.status})`);
         return null;
@@ -89,6 +92,8 @@ export class MarketDiscovery {
     } catch (err) {
       log.error(`Failed to fetch market ${slug}`, { error: err.message });
       return null;
+    } finally {
+      clearTimeout(timer);
     }
   }
 

@@ -1,3 +1,5 @@
+import { readFileSync } from "fs";
+import { join } from "path";
 import { CONFIG, validateConfig } from "./config.js";
 import { BinanceFeed } from "./feeds/binance.js";
 import { PolymarketFeed } from "./feeds/polymarket.js";
@@ -5,10 +7,12 @@ import { Strategy } from "./engine/strategy.js";
 import { RiskManager } from "./engine/risk.js";
 import { Executor } from "./execution/executor.js";
 import { MarketDiscovery } from "./discovery.js";
+import { CalibrationTable } from "./engine/calibration.js";
 import { createLogger, setLogSink } from "./utils/logger.js";
 import { sendAlert } from "./utils/alerts.js";
 import { TUI } from "./utils/tui.js";
 import { saveState, loadState } from "./utils/stateStore.js";
+import { fetchPriceAtTimestamp } from "./utils/chainlink.js";
 
 const log = createLogger("MAIN");
 
@@ -88,6 +92,14 @@ class ArbEngine {
       }
     }
 
+    // ─── Build calibration table from historical data (if available) ──
+    const calibration = this._loadCalibration();
+    if (calibration) {
+      for (const m of this.markets) {
+        m.strategy.calibration = calibration;
+      }
+    }
+
     // Persist state on every trade event + every 30s as a heartbeat
     this.executor.onTradeEvent = () => this._saveState();
     this.saveInterval = setInterval(() => this._saveState(), SAVE_INTERVAL_MS);
@@ -142,6 +154,8 @@ class ArbEngine {
           }
           return;
         }
+
+        signal._estimatedFillProb = this.executor.fillTracker.fillProbability(signal);
 
         const check = this.risk.canTrade(signal);
         if (!check.allowed) {
@@ -242,6 +256,38 @@ class ArbEngine {
     );
   }
 
+  /**
+   * Fetch the Chainlink strike for a market window and set it on the strategy.
+   * Waits until startTime + 2s so the oracle round is finalised before querying.
+   * Falls back to the Binance tick guard (clears pending flag) on any failure.
+   */
+  _seedChainlinkStrike(m, market) {
+    const startTimeMs = market.startTime
+      ? new Date(market.startTime).getTime()
+      : new Date(market.endDate).getTime() - m.windowMins * 60_000;
+
+    const delayMs = Math.max(startTimeMs + 2_000 - Date.now(), 0);
+
+    const timer = setTimeout(async () => {
+      try {
+        const targetSec = Math.floor(startTimeMs / 1000);
+        const result = await fetchPriceAtTimestamp(m.asset, targetSec);
+        if (result) {
+          m.strategy.setStrike(result.price);
+        } else {
+          log.warn(`[${m.asset}/${m.windowMins}m] Chainlink strike unavailable — falling back to Binance`);
+          m.strategy.clearStrikePending();
+        }
+      } catch (err) {
+        log.warn(`[${m.asset}/${m.windowMins}m] Chainlink strike fetch error`, { error: err.message });
+        m.strategy.clearStrikePending();
+      }
+    }, delayMs);
+
+    // Ensure the timer doesn't keep the process alive on shutdown.
+    if (timer.unref) timer.unref();
+  }
+
   /** Discover the current market for one (asset, window) pair and start rotation. */
   async _initMarket(m) {
     const label = `${m.asset}/${m.windowMins}m`;
@@ -256,6 +302,7 @@ class ArbEngine {
 
       this._registerMarketTokens(m, m.activeMarket);
       m.strategy.setMarket(m.activeMarket);
+      this._seedChainlinkStrike(m, m.activeMarket);
 
       // Subscribe to this market's tokens on Polymarket WS
       this.polymarket.addSubscription(m.activeMarket.tokenIdYes, m.activeMarket.tokenIdNo);
@@ -279,6 +326,7 @@ class ArbEngine {
         m.activeMarket = newMarket;
         this._registerMarketTokens(m, newMarket);
         m.strategy.setMarket(newMarket);
+        this._seedChainlinkStrike(m, newMarket);
         this.polymarket.addSubscription(newMarket.tokenIdYes, newMarket.tokenIdNo);
         this.polymarket.startPolling(newMarket.tokenIdYes, 1000);
 
@@ -298,6 +346,35 @@ class ArbEngine {
   _unregisterMarketTokens(market) {
     if (market.tokenIdYes) this.tokenToMarket.delete(market.tokenIdYes);
     if (market.tokenIdNo) this.tokenToMarket.delete(market.tokenIdNo);
+  }
+
+  /**
+   * Load calibration table from historical feature + trade NDJSON files.
+   * Returns null if insufficient data or files don't exist.
+   */
+  _loadCalibration() {
+    try {
+      const dataDir = join(process.cwd(), "data");
+      const featuresRaw = readFileSync(join(dataDir, "features.ndjson"), "utf8");
+      const tradesRaw = readFileSync(join(dataDir, "trades.ndjson"), "utf8");
+
+      const features = featuresRaw.trim().split("\n").filter(Boolean).map(l => JSON.parse(l));
+      const trades = tradesRaw.trim().split("\n").filter(Boolean).map(l => JSON.parse(l));
+
+      const firedCount = features.filter(f => f.outcome === "fired").length;
+      if (firedCount < 200) {
+        log.info(`Calibration: ${firedCount} fired signals (need 200+) — skipping`);
+        return null;
+      }
+
+      const table = CalibrationTable.fromHistory(features, trades);
+      const activeBins = table.bins.filter(b => b.total >= 5).length;
+      log.info(`Calibration table loaded`, { firedSignals: firedCount, activeBins });
+      return table;
+    } catch {
+      log.info("Calibration: no historical data available — using raw model probabilities");
+      return null;
+    }
   }
 
   async shutdown(reason) {

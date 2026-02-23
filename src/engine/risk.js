@@ -92,13 +92,23 @@ export class RiskManager {
       reasons.push(`Edge ${(signal.edge * 100).toFixed(1)}% < cost ${(minViableEdge * 100).toFixed(1)}%`);
     }
 
-    // Minimum liquidity check.
-    // Certainty-arb trades are halved in size and the book is thin by design —
-    // require 1x coverage. Normal trades require 2x to absorb slippage.
+    // Fill probability gate
+    if (signal && signal._estimatedFillProb !== undefined && signal._estimatedFillProb < 0.3) {
+      reasons.push(`Low fill probability: ${(signal._estimatedFillProb * 100).toFixed(0)}%`);
+    }
+
+    // Liquidity check with auto-scaling for thin books.
+    // Scale size down to 75% of available depth rather than blocking outright.
+    // If available depth × 0.75 < $5 floor, block entirely (book too thin to trade).
+    const LIQ_SCALE = 0.75;
+    const LIQ_FLOOR_USD = 5;
     if (signal && signal.availableLiquidity !== undefined) {
-      const minLiq = signal.isCertainty ? signal.size : signal.size * 2;
-      if (signal.availableLiquidity < minLiq) {
+      const maxByDepth = signal.availableLiquidity * LIQ_SCALE;
+      if (maxByDepth < LIQ_FLOOR_USD) {
         reasons.push(`Insufficient liquidity: $${signal.availableLiquidity.toFixed(2)} for $${signal.size.toFixed(2)} trade`);
+      } else if (signal.size > maxByDepth) {
+        // Scale down to fit — position still trades, just smaller.
+        signal.size = Math.round(maxByDepth * 100) / 100;
       }
     }
 

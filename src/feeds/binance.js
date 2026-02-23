@@ -5,6 +5,8 @@ import { EMA } from "../utils/math.js";
 
 const log = createLogger("BINANCE");
 
+const KLINE_FETCH_TIMEOUT_MS = 8_000; // abort hung kline requests after 8s
+
 /**
  * Binance spot orderbook depth feed.
  *
@@ -133,8 +135,10 @@ export class BinanceFeed {
   async fetchRecentVol(minutes = 60) {
     const symbol = this.symbol.toUpperCase();
     const url = `${CONFIG.binance.restUrl}/api/v3/klines?symbol=${symbol}&interval=1m&limit=${minutes + 1}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), KLINE_FETCH_TIMEOUT_MS);
     try {
-      const resp = await fetch(url);
+      const resp = await fetch(url, { signal: controller.signal });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const klines = await resp.json();
       if (!Array.isArray(klines) || klines.length < 2) throw new Error("Insufficient kline data");
@@ -154,6 +158,8 @@ export class BinanceFeed {
     } catch (err) {
       log.warn(`Could not fetch klines for vol seed — using config default`, { symbol, error: err.message });
       return null;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
